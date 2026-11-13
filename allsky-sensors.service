@@ -1,0 +1,19 @@
+[Unit]
+Description=Capteurs et chauffage anti-buée de l'allsky (MQTT)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Remplace TON_UTILISATEUR par un compte membre des groupes i2c et gpio.
+User=TON_UTILISATEUR
+EnvironmentFile=/etc/allsky-sensors.env
+ExecStart=/opt/allsky-sensors/venv/bin/python /opt/allsky-sensors/allsky_sensors_mqtt.py
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+# Chien de garde : si le programme se fige, systemd le tue (ce qui coupe la PWM) puis le relance.
+NotifyAccess=main
+WatchdogSec=90
+
+[Install]
+WantedBy=multi-user.target

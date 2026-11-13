@@ -1,0 +1,9 @@
+# Normalise les fins de ligne en LF : le projet cible Linux (Raspberry Pi).
+# Un shebang ou un fichier systemd en CRLF ne fonctionnerait pas sur la Pi.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.pdf binary
