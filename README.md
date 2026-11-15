@@ -1,7 +1,7 @@
 # Capteurs et chauffage anti-buée de l'allsky, via MQTT
 
-Programme pour la Raspberry Pi de l'allsky (testé sans matériel : simulation, vrai broker Mosquitto, 32 tests). Il :
-1. lit un BME280 (extérieur) et un DS18B20 (dôme), calcule le point de rosée ;
+Programme pour la Raspberry Pi de l'allsky (testé sans matériel : simulation, vrai broker Mosquitto, 57 tests). Il :
+1. lit un BME280 (extérieur), un DS18B20 (dôme) et un MLX90614 (température du ciel), calcule le point de rosée ;
 2. régule un chauffage anti-buée : température du dôme = point de rosée + marge ;
 3. publie tout sur MQTT, y compris le rapport cyclique PWM appliqué.
 
@@ -17,7 +17,10 @@ capteurs + chauffage → Raspberry Pi (ce programme) → broker Mosquitto → in
 | `allsky/outdoor_pressure_station` | BME280 | pression mesurée (hPa), publiée seulement si `ALTITUDE_M` est défini |
 | `allsky/outdoor_dew_point` | calculé | point de rosée (°C), formule de Magnus |
 | `allsky/dome_temperature` | DS18B20 | température dans le dôme (°C) |
+| `allsky/sky_temperature` | MLX90614 | température du ciel (°C), si `mlx90614` est dans `ENABLED` |
 | `allsky/dome_heater_pwm` | chauffage | rapport cyclique appliqué (%), seulement si le chauffage est activé |
+
+`--print-topics` ne liste que les capteurs activés dans `ENABLED` (plus la pression de station si `ALTITUDE_M` est défini, plus `dome_heater_pwm` si le chauffage est activé) : c'est cette liste, et rien d'autre, qu'il faut coller dans indi-allsky.
 
 ## Pression : niveau de la mer ou pression de station
 
@@ -28,10 +31,13 @@ Quelques repères : 1 m d'altitude vaut environ 0,12 hPa, et un BME280 est préc
 
 ## Câblage des capteurs
 
+Le détail broche par broche, le brochage en image, les schémas, la checklist avant mise sous tension et les erreurs fréquentes sont dans **[CABLAGE.md](CABLAGE.md)**. Voici l'essentiel :
+
 - **BME280 (I2C)** : 3,3 V, GND, SDA broche 3 (GPIO 2), SCL broche 5 (GPIO 3). Beaucoup de modules vendus comme BME280 sont des BMP280, sans humidité. Au-delà d'un à deux mètres de câble, l'I2C devient capricieux. Abri ventilé, à l'ombre.
 - **DS18B20 en boîtier TO-92** : face plate vers toi, pattes vers le bas, de gauche à droite : **GND, DQ (données), VDD**. DQ va sur la broche 7 (GPIO 4), VDD sur 3,3 V, avec **4,7 kΩ entre DQ et 3,3 V**. **Une inversion d'alimentation le fait chauffer et le détruit** : vérifie deux fois. Pour mesurer ce qui compte (la surface qui condense), fixe-le contre la paroi intérieure du dôme (ruban adhésif ou colle thermique) plutôt que dans l'air.
+- **MLX90614 (I2C)** : 3,3 V, GND, SDA broche 3 (GPIO 2), SCL broche 5 (GPIO 3) — le même bus que le BME280 — adresse **0x5A**. Ne monte pas le bus à 400 kHz : ce capteur ne fonctionne qu'à 100 kHz, la fréquence par défaut. Deux pièges à connaître : **plexiglas et verre sont opaques à l'infrarouge lointain** (8-14 µm), donc un MLX90614 placé sous le dôme mesure la paroi du dôme, pas le ciel — il doit voir le ciel directement, par une ouverture ou derrière une fenêtre transparente à l'IR (film polyéthylène ou polypropylène très fin) ; et **tout ce qui le réchauffe fausse la mesure** (soleil, boîtier fermé, électronique voisine), puisqu'il se sert de sa propre température comme référence. À l'abri de la pluie : une visée mouillée ne mesure plus rien.
 
-`sudo raspi-config` → Interface Options : active **I2C** et **1-Wire**, puis redémarre. Vérifications : `i2cdetect -y 1` (76 ou 77) et `ls /sys/bus/w1/devices/` (`28-…`).
+`sudo raspi-config` → Interface Options : active **I2C** et **1-Wire**, puis redémarre. Vérifications : `i2cdetect -y 1` (76 ou 77 pour le BME280, 5a pour le MLX90614) et `ls /sys/bus/w1/devices/` (`28-…`).
 
 ## Chauffage : dimensionnement et câblage (alimentation 5 V)
 
@@ -87,6 +93,10 @@ cd /opt/allsky-sensors
 - il dit « aucun DS18B20 détecté » : `ls /sys/bus/w1/devices/` ne doit pas contenir que `w1_bus_master1`. Vérifie DQ sur la broche 7 (GPIO 4), la résistance de 4,7 kΩ entre DQ et 3,3 V, l'alimentation, et le sens du TO-92 (face plate vers toi : GND, DQ, VDD). **Si le capteur chauffe, débranche-le tout de suite** : il est à l'envers ;
 - `dmesg | grep -i w1` et `lsmod | grep w1` montrent si le noyau a chargé `w1_gpio` et `w1_therm`.
 
+**Si le MLX90614 n'apparaît pas** (« capteur mlx90614 indisponible ») :
+- `i2cdetect -y 1` doit afficher `5a` : sinon, vérifie l'alimentation (3,3 V, pas 5 V sur un module « 3 V » sans régulateur), les soudures et la longueur des câbles (au-delà d'un mètre, l'I2C devient capricieux) ;
+- il est détecté mais aucune valeur n'arrive : les mesures aberrantes sont ignorées (hors de -80 à +150 °C, dont le -273,15 °C d'un capteur non alimenté) — regarde le journal, et vérifie que `MLX90614_OFFSET_C` est bien entre -20 et +20 °C.
+
 `--dry-run` et `--simulate` ne touchent **jamais** aux GPIO. Pour le chauffage, avec `HEATER_ENABLED=1` et `HEATER_SUPPLY_VOLTS` dans l'environnement :
 
 1. **À vide**, charge débranchée : `--heater-test 50` pendant 10 s ; vérifie au multimètre ou avec une LED que la sortie du module commute.
@@ -100,6 +110,7 @@ cd /opt/allsky-sensors
 - coupure si le dôme atteint `HEATER_MAX_DOME_TEMP` (35 °C par défaut) ;
 - coupure à l'arrêt du programme ; la PWM est logicielle : si le programme est tué, le signal s'arrête avec lui ;
 - chien de garde systemd : si le programme se fige, il est tué (PWM coupée) puis relancé ;
+- mesures du MLX90614 manifestement fausses ignorées (hors de -80 à +150 °C) ;
 - GPIO 2, 3 et 4 refusés (I2C et 1-Wire).
 
 ## Réglages du chauffage (`/etc/allsky-sensors.env`)
@@ -147,7 +158,7 @@ sudo systemctl enable --now allsky-sensors
 
 ## Réglage d'indi-allsky
 
-Ajoute un capteur de type **MQTT Broker**. Dans le champ « Pin », colle la liste donnée par `--print-topics` (10 topics au plus, séparés par des virgules, chaque valeur étant un nombre). Les noms viennent du dernier élément du topic, d'où les noms distincts.
+Ajoute un capteur de type **MQTT Broker**. Dans le champ « Pin », colle la liste donnée par `--print-topics` (10 topics au plus, séparés par des virgules, chaque valeur étant un nombre). Cette liste suit `ENABLED` : recolle-la après chaque changement de capteur. Les noms viennent du dernier élément du topic, d'où les noms distincts.
 Je n'ai pas pu vérifier dans la documentation où se règlent l'adresse et les identifiants du broker pour ce capteur : ce sont en principe les réglages MQTT d'indi-allsky.
 Regarde ensuite dans `latest_metadata.json` quels `sensor_user_N` ont reçu les valeurs (le numéro d'emplacement n'est pas précisé par la doc).
 
@@ -163,13 +174,34 @@ SENSORS = {
     "sensor_user_13": ("Point de rosée", "°C"),
     "sensor_user_14": ("Température du dôme", "°C"),
     "sensor_user_15": ("Chauffage du dôme", "%"),
+    "sensor_user_16": ("Température du ciel", "°C"),
 }
 ```
 
-## Plus tard : température du ciel
+## Température du ciel (MLX90614)
 
-Un MLX90614 (I2C) se lit sur le même bus : il suffira d'ajouter une classe de lecture et un topic `sky_temperature`.
+Un ciel dégagé rayonne très peu en infrarouge : sa « température » est souvent 20 à 40 °C sous celle de l'air, alors qu'un ciel couvert se rapproche de la température de l'air (quelques degrés d'écart). C'est sur quoi reposent les détecteurs de nuages, et c'est aussi ce que subit le dôme : tourné vers le ciel, il se refroidit par rayonnement, descend sous la température de l'air et se couvre de buée (puis de rosée) avant tout le reste du matériel.
+
+Le MLX90614 mesure cette température de rayonnement, sans contact. Pour l'activer, ajoute-le à `ENABLED` :
+
+```
+ENABLED=bme280,ds18b20,mlx90614
+```
+
+| Variable | Défaut | Rôle |
+|---|---|---|
+| `MLX90614_ADDRESS` | 0x5A | adresse I2C du capteur |
+| `MLX90614_OFFSET_C` | 0 | correction (°C, de -20 à +20) si le capteur lit faux |
+
+Repères pour vérifier le montage :
+
+- vise un mur à l'ombre (ou pose une plaque devant l'ouverture) : la mesure doit tomber à 1 ou 2 °C de `outdoor_temperature` ; sinon, corrige avec `MLX90614_OFFSET_C` ;
+- la nuit, sous un ciel dégagé, compte 15 à 30 °C de moins que l'air ; sous un ciel bouché, presque autant que l'air ;
+- une valeur hors de -80 à +150 °C est traitée comme une erreur de lecture et n'est pas publiée : le topic garde sa dernière valeur, puis n'est plus mis à jour au bout de 10 minutes ;
+- le programme ne touche pas au facteur d'émission du capteur (réglé dans son EEPROM) et ne publie pas sa mesure « ambiante » interne, qui ne vaut pas un vrai thermomètre d'air.
+
+Cette mesure ne commande encore rien : la régulation du chauffage continue de comparer la température du dôme au point de rosée de l'air. Elle sert pour l'instant à l'affichage, et à repérer un ciel clair ou couvert.
 
 ## Développement
 
-`pip install pytest ruff` puis `pytest` et `ruff check .` : 32 tests (point de rosée, DS18B20, plafond de puissance, sécurités, régulation en boucle fermée, sortie PWM simulée, chien de garde).
+`pip install pytest ruff` puis `pytest` et `ruff check .` : 57 tests (point de rosée, DS18B20, MLX90614, plafond de puissance, sécurités, régulation en boucle fermée, sortie PWM simulée, chien de garde). Deux sont ignorés si gpiozero n'est pas installé, et celui du chien de garde systemd a besoin d'un socket Unix : il ne passe que sur Linux.

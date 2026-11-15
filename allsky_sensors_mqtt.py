@@ -4,6 +4,7 @@
 Capteurs :
   - BME280 (I2C)     : température, humidité et pression extérieures ; point de rosée calculé
   - DS18B20 (1-Wire) : température dans le dôme
+  - MLX90614 (I2C)   : température du ciel, lue par un thermomètre infrarouge sans contact
 Chauffage anti-buée (facultatif, HEATER_ENABLED=1) :
   - commande PWM d'un module MOSFET alimentant des résistances ; régulation de la température du dôme
     à (point de rosée + marge) ; le rapport cyclique appliqué est publié (dome_heater_pwm, en %).
@@ -31,14 +32,14 @@ from pathlib import Path
 log = logging.getLogger("allsky-sensors")
 
 PREFIX = os.getenv("MQTT_PREFIX", "allsky")
+DEFAULT_SENSORS = "bme280,ds18b20"  # capteurs lus si ENABLED n'est pas défini
+# Capteurs (variable ENABLED) et topics qu'ils publient, dans l'ordre de publication.
 # Le dernier élément du topic sert de nom dans indi-allsky : il doit être distinct d'un topic à l'autre.
-SENSOR_TOPICS = (
-    "outdoor_temperature",
-    "outdoor_humidity",
-    "outdoor_pressure",
-    "outdoor_dew_point",
-    "dome_temperature",
-)
+SENSOR_TOPICS = {
+    "bme280": ("outdoor_temperature", "outdoor_humidity", "outdoor_pressure", "outdoor_dew_point"),
+    "ds18b20": ("dome_temperature",),
+    "mlx90614": ("sky_temperature",),
+}
 HEATER_TOPIC = "dome_heater_pwm"
 W1_DEVICES = Path("/sys/bus/w1/devices")
 
@@ -261,13 +262,25 @@ class NullOutput:
 # --------------------------------------------------------------------------- capteurs
 
 
+_I2C_BUS = None  # le bus I2C de la carte, ouvert une seule fois : le BME280 et le MLX90614 le partagent
+
+
+def i2c_bus():
+    """Bus I2C de la carte, ouvert au premier besoin."""
+    global _I2C_BUS
+    if _I2C_BUS is None:
+        import board
+
+        _I2C_BUS = board.I2C()
+    return _I2C_BUS
+
+
 class Bme280:
     def __init__(self, address: int, altitude: float | None = None) -> None:
         self._altitude = altitude
-        import board
         from adafruit_bme280 import basic as adafruit_bme280
 
-        self._device = adafruit_bme280.Adafruit_BME280_I2C(board.I2C(), address=address)
+        self._device = adafruit_bme280.Adafruit_BME280_I2C(i2c_bus(), address=address)
 
     def read(self) -> dict[str, float]:
         temp = float(self._device.temperature)
@@ -307,6 +320,27 @@ class Ds18b20:
         return {} if value is None else {"dome_temperature": value + self._offset}
 
 
+class Mlx90614:
+    """Thermomètre infrarouge sans contact : mesure la température de ce qu'il vise (le ciel, la nuit).
+
+    La valeur ne veut rien dire si le capteur vise autre chose que le ciel (dôme, mur, sol, sa propre
+    monture). Verre et plexiglas sont opaques à l'infrarouge lointain (8-14 µm) : placé sous le dôme,
+    il mesure la température du dôme, pas celle du ciel. Le bus I2C doit rester à 100 kHz (défaut).
+    """
+
+    def __init__(self, address: int, offset: float = 0.0) -> None:
+        self._offset = offset  # correction (°C) ajoutée à la mesure brute, pour un capteur qui lit faux
+        import adafruit_mlx90614
+
+        self._device = adafruit_mlx90614.MLX90614(i2c_bus(), address=address)
+
+    def read(self) -> dict[str, float]:
+        value = float(self._device.object_temperature) + self._offset
+        if not -80 <= value <= 150:  # -273,15 °C : capteur non alimenté ; au-delà : erreur de bus
+            return {}
+        return {"sky_temperature": value}
+
+
 class Simulated:
     """Valeurs plausibles pour tester sans matériel."""
 
@@ -322,6 +356,7 @@ class Simulated:
             "outdoor_humidity": humidity,
             "outdoor_pressure": station,
             "dome_temperature": 11 + 2 * phase,
+            "sky_temperature": temp - 18 + 6 * phase,  # ciel clair : bien plus froid que l'air
         }
         if self._altitude is not None:
             values["outdoor_pressure"] = sea_level_pressure(station, temp, self._altitude)
@@ -346,15 +381,33 @@ class WarnOnce:
             self._last[key] = now
 
 
-def ds18b20_offset() -> float:
-    """Correction du DS18B20 en °C (variable DS18B20_OFFSET_C, 0 par défaut). Lève ValueError si elle est invalide."""
-    text = os.getenv("DS18B20_OFFSET_C", "").strip()
+def enabled_sensors() -> list[str]:
+    """Capteurs à lire (variable ENABLED, « bme280,ds18b20 » par défaut)."""
+    return [name.strip() for name in os.getenv("ENABLED", DEFAULT_SENSORS).split(",") if name.strip()]
+
+
+def temp_offset(variable: str, limit: float) -> float:
+    """Correction (°C) lue dans une variable d'environnement, 0 si elle n'est pas définie.
+
+    Lève ValueError si la valeur n'est pas un nombre ou si elle sort de la plage ± limit.
+    """
+    text = os.getenv(variable, "").strip()
     if not text:
         return 0.0
     value = float(text)
-    if not -10 <= value <= 10:
-        raise ValueError("DS18B20_OFFSET_C doit être compris entre -10 et 10 °C")
+    if not -limit <= value <= limit:
+        raise ValueError(f"{variable} doit être compris entre {-limit:g} et {limit:g} °C")
     return value
+
+
+def ds18b20_offset() -> float:
+    """Correction du DS18B20 en °C (variable DS18B20_OFFSET_C, 0 par défaut). Lève ValueError si elle est invalide."""
+    return temp_offset("DS18B20_OFFSET_C", 10)
+
+
+def mlx90614_offset() -> float:
+    """Correction du MLX90614 en °C (variable MLX90614_OFFSET_C, 0 par défaut). Lève ValueError si elle est invalide."""
+    return temp_offset("MLX90614_OFFSET_C", 20)
 
 
 def build_sensor(name: str, altitude: float | None = None):
@@ -362,6 +415,8 @@ def build_sensor(name: str, altitude: float | None = None):
         return Bme280(int(os.getenv("BME280_ADDRESS", "0x76"), 16), altitude)
     if name == "ds18b20":
         return Ds18b20(os.getenv("DS18B20_ID") or None, ds18b20_offset())
+    if name == "mlx90614":
+        return Mlx90614(int(os.getenv("MLX90614_ADDRESS", "0x5a"), 16), mlx90614_offset())
     raise ValueError(f"capteur inconnu : {name}")
 
 
@@ -428,9 +483,15 @@ class Publisher:
 
 
 def topic_names() -> tuple[str, ...]:
-    names = list(SENSOR_TOPICS)
-    if os.getenv("ALTITUDE_M", "").strip():  # avec l'altitude, la pression de station est publiée en plus
-        names.insert(names.index("outdoor_pressure") + 1, "outdoor_pressure_station")
+    """Topics à coller dans le champ « Pin » d'indi-allsky : ceux des capteurs activés, et ceux qui dépendent des réglages."""
+    enabled = enabled_sensors()
+    names: list[str] = []
+    for sensor, topics in SENSOR_TOPICS.items():
+        if sensor not in enabled:
+            continue  # capteur non activé : son topic ne serait jamais publié
+        names += topics
+        if sensor == "bme280" and os.getenv("ALTITUDE_M", "").strip():  # avec l'altitude, la pression de station est publiée en plus
+            names.insert(names.index("outdoor_pressure") + 1, "outdoor_pressure_station")
     if os.getenv("HEATER_ENABLED", "0") == "1":
         names.append(HEATER_TOPIC)
     return tuple(names)
@@ -488,9 +549,16 @@ def main() -> int:
     if offset:
         log.info("DS18B20 : correction de %+g °C appliquée à la température du dôme", offset)
 
+    try:
+        sky_offset = mlx90614_offset()
+    except ValueError as error:
+        log.error("MLX90614_OFFSET_C invalide : %s", error)
+        return 2
+    if sky_offset:
+        log.info("MLX90614 : correction de %+g °C appliquée à la température du ciel", sky_offset)
+
     interval = int(os.getenv("INTERVAL", "60"))
-    enabled = [s.strip() for s in os.getenv("ENABLED", "bme280,ds18b20").split(",") if s.strip()]
-    names = ["simulation"] if args.simulate else enabled
+    names = ["simulation"] if args.simulate else enabled_sensors()
     altitude_text = os.getenv("ALTITUDE_M", "").strip()
     try:
         altitude = float(altitude_text) if altitude_text else None

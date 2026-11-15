@@ -211,7 +211,8 @@ def test_heater_test_is_capped_and_always_switched_off(mock_gpio, monkeypatch):
 
 
 def run_main(monkeypatch, capsys, args, env):
-    for key in [k for k in os.environ if k.startswith(("HEATER_", "MQTT_", "ALTITUDE_"))]:
+    prefixes = ("HEATER_", "MQTT_", "ALTITUDE_", "MLX90614_", "DS18B20_", "BME280_", "ENABLED")
+    for key in [k for k in os.environ if k.startswith(prefixes)]:
         monkeypatch.delenv(key)
     for key, value in env.items():
         monkeypatch.setenv(key, value)
@@ -324,3 +325,93 @@ def test_simulation_with_altitude_prints_both_pressures(monkeypatch, capsys):
     assert code == 0
     pressures = {line.split()[0]: float(line.split()[1]) for line in out.splitlines() if "pressure" in line}
     assert pressures["allsky/outdoor_pressure"] > pressures["allsky/outdoor_pressure_station"] + 40
+
+
+# ----------------------------------------------------------------------------- température du ciel (MLX90614)
+
+
+def make_mlx(offset=0.0):
+    from types import SimpleNamespace
+
+    sensor = sensors.Mlx90614.__new__(sensors.Mlx90614)  # sans matériel : on court-circuite l'initialisation
+    sensor._device = SimpleNamespace(object_temperature=-12.34)
+    sensor._offset = offset
+    return sensor
+
+
+def test_mlx90614_publishes_the_sky_temperature():
+    assert make_mlx().read() == {"sky_temperature": pytest.approx(-12.34)}
+    assert make_mlx(offset=2.5).read() == {"sky_temperature": pytest.approx(-9.84)}
+
+
+def test_mlx90614_discards_implausible_readings():
+    sensor = make_mlx()
+    sensor._device.object_temperature = -273.15  # capteur non alimenté
+    assert sensor.read() == {}
+    sensor._device.object_temperature = 382.19  # erreur de bus
+    assert sensor.read() == {}
+
+
+def test_build_sensor_uses_the_configured_mlx90614_address(monkeypatch):
+    built = []
+    monkeypatch.setattr(sensors, "Mlx90614", lambda address, offset: built.append((address, offset)))
+    monkeypatch.delenv("MLX90614_ADDRESS", raising=False)
+    monkeypatch.delenv("MLX90614_OFFSET_C", raising=False)
+    sensors.build_sensor("mlx90614")
+    monkeypatch.setenv("MLX90614_ADDRESS", "0x5B")
+    monkeypatch.setenv("MLX90614_OFFSET_C", "-2")
+    sensors.build_sensor("mlx90614")
+    assert built == [(0x5A, 0.0), (0x5B, -2.0)]
+
+
+def test_enabled_sensors_ignores_blank_entries(monkeypatch):
+    monkeypatch.setenv("ENABLED", " bme280 , mlx90614 ,,")
+    assert sensors.enabled_sensors() == ["bme280", "mlx90614"]
+    monkeypatch.delenv("ENABLED")
+    assert sensors.enabled_sensors() == ["bme280", "ds18b20"]
+
+
+def test_temp_offsets_are_optional_and_bounded(monkeypatch):
+    for variable in ("DS18B20_OFFSET_C", "MLX90614_OFFSET_C"):
+        monkeypatch.delenv(variable, raising=False)
+    assert sensors.ds18b20_offset() == 0.0
+    assert sensors.mlx90614_offset() == 0.0
+    monkeypatch.setenv("MLX90614_OFFSET_C", "-3.5")
+    assert sensors.mlx90614_offset() == -3.5
+    monkeypatch.setenv("DS18B20_OFFSET_C", "11")
+    with pytest.raises(ValueError, match="entre -10 et 10"):
+        sensors.ds18b20_offset()
+
+
+@pytest.mark.parametrize("value", ["abc", "25", "-20.1"])
+def test_invalid_mlx90614_offset_is_refused_by_the_program(monkeypatch, capsys, value):
+    code, _ = run_main(monkeypatch, capsys, ["--simulate", "--dry-run", "--once"], {"MLX90614_OFFSET_C": value})
+    assert code == 2  # le programme refuse de démarrer : le journal dit quoi corriger
+
+
+def test_topic_list_follows_the_enabled_sensors(monkeypatch, capsys):
+    _, out = run_main(monkeypatch, capsys, ["--print-topics"], {})
+    assert "allsky/sky_temperature" not in out  # MLX90614 non activé : topic jamais publié, donc absent de la liste
+    _, out = run_main(monkeypatch, capsys, ["--print-topics"], {"ENABLED": "bme280,ds18b20,mlx90614"})
+    names = [topic.split("/")[1] for topic in out.strip().split(",")]
+    assert names == [
+        "outdoor_temperature",
+        "outdoor_humidity",
+        "outdoor_pressure",
+        "outdoor_dew_point",
+        "dome_temperature",
+        "sky_temperature",
+    ]
+
+
+def test_topic_list_stays_within_the_indi_allsky_limit(monkeypatch, capsys):
+    env = {"ENABLED": "bme280,ds18b20,mlx90614", "ALTITUDE_M": "500", "HEATER_ENABLED": "1"}
+    _, out = run_main(monkeypatch, capsys, ["--print-topics"], env)
+    assert len(out.strip().split(",")) <= 10  # le champ « Pin » d'indi-allsky n'accepte que 10 topics
+
+
+def test_simulation_shows_a_sky_colder_than_the_air(monkeypatch, capsys):
+    code, out = run_main(monkeypatch, capsys, ["--simulate", "--dry-run", "--once"], {})
+    values = {line.split()[0]: float(line.split()[1]) for line in out.splitlines()}
+    assert code == 0
+    assert values["allsky/sky_temperature"] < values["allsky/outdoor_temperature"]
