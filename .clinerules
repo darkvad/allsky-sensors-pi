@@ -1,0 +1,5 @@
+# Règles Cline pour ce dépôt
+
+Avant toute action sur ce projet, lire en premier lieu le fichier `agents.md` à la racine, et en respecter les règles.
+
+Rappel de la règle prioritaire (détaillée dans `agents.md`) : ne jamais exécuter `git push` (y compris `--force`, `--tags`, création ou suppression de branches distantes, ou toute publication vers GitHub) sans une demande expresse de l'utilisateur dans son message courant. En cas de doute, ne pas pousser et demander.
