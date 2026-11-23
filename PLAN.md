@@ -43,8 +43,9 @@ Deux fonctionnalités demandées :
 
 ```json
 {"updated_at": 0.0, "mode": "auto", "target_c": null, "override_target_c": null,
- "override_expires_at": null, "dome_c": 9.5, "dew_c": -2.3, "duty_pct": 0.0, "readings": {},
- "sensors_unavailable": [], "config_error": null, "settings_mtime": 0.0, "pid": 0}
+ "override_expires_at": null, "dome_c": 9.5, "dew_c": -2.3, "duty_pct": 0.0,
+ "sky_delta": null, "anticipation_c": 0.0, "readings": {}, "sensors_unavailable": [],
+ "config_error": null, "settings_mtime": 0.0, "pid": 0}
 ```
 
 ### Commandes de forçage (étape 1 ✅)
@@ -90,6 +91,8 @@ défaut `/etc/allsky-sensors/allsky-sensors.env`) est lu par la commande, donc e
 | `SKY_TEMP_TOPIC` / `SKY_TEMP_KEY` | (vide) / `infrared.skyTemperature` | après 6 ✅ | topic JSON du SQMeter et chemin de la température |
 | `SKY_STALE_KEY` / `SKY_STATUS_KEY` | `dataStale` / `infrared.status` | après 6 ✅ | garde-fous annoncés par la source (vide : pas de contrôle) |
 | `SKY_MAX_AGE` | `600` | après 6 ✅ | fraîcheur admise d'une valeur externe |
+| `SKY_ANTICIPATION_C` | `0` (désactivé) | après 6 ✅ | marge (°C) ajoutée quand le ciel est dégagé |
+| `SKY_CLEAR_DELTA_C` / `SKY_CLEAR_HYSTERESIS_C` | `-10` / `2` | après 6 ✅ | seuil `ciel − air` et hystérésis de retour |
 
 ## 4. Avancement
 
@@ -103,6 +106,7 @@ défaut `/etc/allsky-sensors/allsky-sensors.env`) est lu par la commande, donc e
 | 5 | Web : formulaire de réglages | ✅ **terminé** | formulaire depuis `ENV_SCHEMA`, `POST /reglages` (303) + jeton anti-CSRF, 46 tests web, 203 verts au total |
 | 6 | Web : commandes de forçage | ✅ **terminé** | `/chauffage`, `POST /forcer` et `POST /forcer/annuler` ; 70 tests dans `tests/test_web_api.py`, 227 verts au total ; chaîne vérifiée en direct le 23/11 (`override.json` → `heater_mode force`, `status.json` `mode force` cible 18,0, puis `auto` après annulation) |
 | 6b | Cœur : température du ciel par MQTT (SQMeter) | ✅ **terminé** | `SKY_*`, `SkyConfig`, `read_sky_payload`, `SkyFeed` ; 20 tests ajoutés (247 verts au total) ; message du SQMeter → `allsky/sky_temperature 23.9` et `status.json` vérifiés |
+| 6c | Cœur : anticipation par ciel dégagé | ✅ **terminé** | `SKY_ANTICIPATION_C`/`SKY_CLEAR_*`, `sky_delta`, hystérésis, `margin_bonus` du régulateur ; 16 tests ajoutés (263 verts au total) ; vérifié : `ciel − air = −41,4 °C` → cible 21,0 (rosée 15 + marge 4 + 2) |
 | 7 | Déploiement, doc, README | ⏳ à faire | |
 
 ## 5. Détail des étapes
@@ -903,7 +907,7 @@ Contrainte matérielle (23/11) : les résistances de **2 W ne tiennent pas sous 
 Piste réaliste : **8 × 1 W** → 4,0 W au plafond, 0,80 A, même fusible de 1 A (marge juste) ; les deux
 unités supplémentaires se dispersent mieux autour du dôme que des 2 W serrées. Au-delà de 8, le courant
 dépasse le fusible (10 → 1,0 A) : à remplacer avant d'y penser. En attendant, le levier gratuit reste
-l'anticipation (voir « Température du ciel : MQTT ou Alpaca »).
+l'anticipation (voir « Température du ciel par MQTT »).
 
 ### Prochaine étape
 
@@ -987,12 +991,48 @@ python -m pytest -q               # suite complète
   (ligne « température du ciel reçue sur sqmeter/state ») et
   `mosquitto_sub -t 'allsky/sky_temperature' -v`.
 
-#### Anticipation (suite, non livrée)
+#### Anticipation par ciel dégagé (livrée le 23/11)
 
-Une fois la mesure fiable, l'usage qui apporte vraiment quelque chose à 3-4 W : quand le ciel se
-dégage (`ciel − air` qui décroche, ou magnitude élevée), **relever la marge** ou avancer le chauffage
-au lieu d'attendre que le dôme atteigne la cible. À faire avec des mesures réelles, un seuil et une
-hystérésis à régler sur le dôme — et sans jamais contourner les sécurités ci-dessus.
+Déclencheur choisi : `ciel − air` (générique, fonctionne avec le MLX90614 local comme avec le
+SQMeter). Un ciel clair rayonne : le dôme descend sous la température de l'air, donc on vise plus haut
+**avant** que la cible nominale ne soit atteinte.
+
+| Variable | Défaut | Rôle |
+|---|---|---|
+| `SKY_ANTICIPATION_C` | `0` (désactivé) | marge (°C) ajoutée à la cible automatique par ciel dégagé |
+| `SKY_CLEAR_DELTA_C` | `-10` | seuil : ciel dégagé si `ciel − air` ≤ cette valeur |
+| `SKY_CLEAR_HYSTERESIS_C` | `2` | retour à la marge nominale au-dessus de `seuil + hystérésis` |
+
+- `sky_delta()` : écart calculé à chaque tick, uniquement si les deux mesures ont moins de 120 s ;
+  publié dans `status.json` **même quand l'anticipation est désactivée** (pour régler le seuil) ;
+- `anticipation_state()` : état « ciel dégagé » avec hystérésis, remis à faux si une mesure manque
+  (on ne chauffe pas plus sans savoir pourquoi) ;
+- `HeaterController.update(..., margin_bonus=)` : en automatique, cible = rosée + marge + bonus,
+  plafonnée à `HEATER_MAX_DOME_TEMP` ; **sans effet en mode forcé** ;
+- sécurités inchangées (plafond `max_duty`, coupure en surchauffe, dôme périmé) ;
+- journal aux transitions : « ciel dégagé (ciel - air = … °C) : marge majorée de … °C » et « ciel de
+  nouveau couvert … : marge nominale » ;
+- page `/` : deux lignes de plus, « Ciel − air extérieur » et « Anticipation » ; formulaire
+  `/reglages` : section « Anticipation (ciel dégagé) ».
+
+**Tester (sans matériel) :**
+
+```powershell
+python -m pytest -q -k "anticipation or sky_delta or margin_bonus"
+```
+
+Attendu : hystérésis (franchissement à −10 °C, maintien jusqu'à −8 °C, retour au-delà), mesure
+périmée → marge nominale, consigne forcée → bonus ignoré, cible plafonnée à `HEATER_MAX_DOME_TEMP`.
+
+Vérifié en direct le 23/11 (SQMeter « ciel clair » −15 °C, air 26,4 °C, dôme 20 °C, rosée 15 °C,
+`SKY_ANTICIPATION_C=2`) : `ciel − air = −41,4 °C`, `anticipation_c = 2`, cible **21,0 °C**,
+`allsky/heater_target 21.00`, chauffage 5 %.
+
+**Réglage sur la Pi** : laisser `SKY_ANTICIPATION_C=0` quelques nuits, relever `sky_delta` dans
+`status.json` (ou la page `/`) par ciel clair et par ciel couvert, puis choisir un seuil entre les
+deux et une marge de 1 à 3 °C. `SKY_MAX_AGE` (600 s) doit rester cohérent avec la période de
+publication du SQMeter.
+
 
 
 
@@ -1014,11 +1054,11 @@ formulaire `/reglages` qui écrit `/etc/allsky-sensors/allsky-sensors.env` (jeto
   permission d'écriture va dans l'unité de la Pi (le message de `/reglages` la nomme) ;
 - `Referrer-Policy: same-origin` et jeton `_jeton` : les deux sont liés (voir incidents du 22/11).
 
-**État du dépôt** : les étapes 1 à 6 sont **commitées et poussées** (`dfae436`, « Interface web :
-forçage du chauffage (étape 6) »). La température du ciel par MQTT est livrée dans l'arbre de travail
-(`allsky_sensors_mqtt.py`, `tests/test_allsky_sensors.py`, `allsky-sensors.env.example`, `README.md`,
+**État du dépôt** : les étapes 1 à 6 sont **commitées et poussées** (`dfae436` pour l'étape 6,
+`0391e9b` pour la température du ciel par MQTT). L'anticipation par ciel dégagé est livrée dans
+l'arbre de travail (`allsky_sensors_mqtt.py`, `web_api.py`, tests, exemple d'environnement, README,
 ce document), pas encore commitée.
-`pytest` : 247 passés, 2 ignorés (gpiozero absent sous Windows), 1 échec `AF_UNIX` pré-existant sous
+`pytest` : 263 passés, 2 ignorés (gpiozero absent sous Windows), 1 échec `AF_UNIX` pré-existant sous
 Windows ; `ruff` : OK.
 
 ### Étape 6 livrée (23/11)
@@ -1050,12 +1090,27 @@ que le service) ; le MLX90614 du SQMeter est la seule source utile (`infrared.sk
   `ruff` OK ;
 - vérifié en direct : message du SQMeter injecté dans le service → `allsky/sky_temperature 23.9` et
   `status.json` `readings.sky_temperature = 23.9` ;
-- reste à faire sur la Pi : renseigner `SKY_TEMP_TOPIC=sqmeter/state` dans
-  `/etc/allsky-sensors/allsky-sensors.env` (ou via `/reglages`), puis vérifier le journal et le topic.
-  L'anticipation (relever la marge quand le ciel se dégage) reste à concevoir sur des mesures réelles.
+- déployé sur la Pi le 23/11 (`SKY_TEMP_TOPIC=sqmeter/state`) : journal « température du ciel lue sur
+  sqmeter/state (message JSON) », puis « température du ciel reçue sur sqmeter/state : 23.9 °C ».
+
+### Anticipation livrée (23/11)
+
+- `SKY_ANTICIPATION_C` (défaut `0`, désactivée), `SKY_CLEAR_DELTA_C` (`-10`), `SKY_CLEAR_HYSTERESIS_C`
+  (`2`) ; formulaire `/reglages` et `--print-topics` inchangés côté topics (l'anticipation ne publie
+  rien de plus) ;
+- `sky_delta()` (frais ≤ 120 s) et `anticipation_state()` (hystérésis, mesure manquante = marge
+  nominale) ; `margin_bonus` du régulateur, sans effet en mode forcé et plafonné à
+  `HEATER_MAX_DOME_TEMP` ;
+- `status.json` : `sky_delta` et `anticipation_c` (le delta est publié même désactivé, pour régler le
+  seuil) ; page `/` : lignes « Ciel − air extérieur » et « Anticipation » ;
+- 16 tests ajoutés ; suite : **263 passés, 2 ignorés, 1 échec `AF_UNIX` pré-existant**, `ruff` OK ;
+- vérifié en direct (SQMeter −15 °C, air 26,4 °C, dôme 20 °C, rosée 15 °C, bonus 2) :
+  `ciel − air = −41,4 °C`, cible 21,0 °C, `heater_target 21.00`, chauffage 5 % ;
+- à faire sur la Pi : observer `sky_delta` quelques nuits (ciel clair / couvert) avant d'activer
+  `SKY_ANTICIPATION_C` (1 à 3 °C), puis surveiller le journal.
 
 **Prochaine session** : étape 7 — déploiement et documentation (README : interface web et sécurité,
-chapitre forçage, température du ciel par MQTT, installation des deux unités, topics d'état ; compte
-de tests à jour), puis `ReadWritePaths` déjà en place pour `STATE_DIR` sur la Pi.
+chapitre forçage, température du ciel par MQTT, anticipation, installation des deux unités, topics
+d'état ; compte de tests à jour), puis `ReadWritePaths` déjà en place pour `STATE_DIR` sur la Pi.
 
 

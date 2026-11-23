@@ -128,6 +128,8 @@ cd /opt/allsky-sensors
 
 Les gains par défaut sont stables sur un modèle de dôme (deux inerties, retard de 60 s, chauffages faibles ou forts), sans dépassement ni oscillation. **C'est un modèle, pas ton dôme** : si la température oscille, baisse `HEATER_KP` ; si elle est trop lente à rattraper, monte `HEATER_KI` un peu.
 
+**Anticipation par ciel dégagé** (facultatif) : un ciel clair fait rayonner le dôme, qui descend sous la température de l'air. Quand `ciel − air` passe sous `SKY_CLEAR_DELTA_C` (défaut −10 °C), la cible automatique est relevée de `SKY_ANTICIPATION_C` (défaut 0 = désactivé), avec une hystérésis de retour `SKY_CLEAR_HYSTERESIS_C` (2 °C) pour éviter de battre quand un nuage passe. La mesure du ciel peut venir du MLX90614 local ou de `SKY_TEMP_TOPIC` (SQMeter) ; sans mesure fraîche du ciel ou de l'air, la marge nominale revient. Le forçage ignore l'anticipation, et les sécurités (plafond de puissance, coupure en surchauffe, dôme périmé) restent inchangées. La page `/` affiche `ciel − air` et l'anticipation appliquée.
+
 ## Le broker (sur le Linux d'indi-allsky)
 
 Le dépôt d'indi-allsky contient un script de déploiement de Mosquitto (`./misc/setup_mosquitto.sh`). Sinon : `sudo apt install mosquitto mosquitto-clients`.

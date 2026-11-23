@@ -158,6 +158,22 @@ def test_consigne_forcee_affichee_avec_le_temps_restant(serveur):
     assert "Forcé" in body and "Consigne forcée" in body and "20,0 °C" in body and "encore" in body
 
 
+def test_ciel_et_anticipation_affiches(serveur):
+    _, port, status_file = serveur
+    sensors.write_status(status_file, status_payload(sky_delta=-12.5, anticipation_c=2.0))
+    _, _, body = call(port)
+    assert "Ciel − air extérieur" in body and "-12,5 °C" in body
+    assert "Anticipation" in body and "+2,0 °C (ciel dégagé)" in body
+
+
+def test_anticipation_inactive_affichee(serveur):
+    _, port, status_file = serveur
+    sensors.write_status(status_file, status_payload(sky_delta=-3.0, anticipation_c=0))
+    _, _, body = call(port)
+    assert "Ciel − air extérieur" in body and "-3,0 °C" in body
+    assert "inactive" in body
+
+
 def test_config_error_est_affichee_et_echappee(serveur):
     _, port, status_file = serveur
     sensors.write_status(status_file, status_payload(config_error="HEATER_MARGIN : <script>alert(1)</script>"))
@@ -378,7 +394,7 @@ def test_formulaire_affiche_les_sections_et_masque_les_secrets(serveur):
     env_file = server.app.env_file
     code, headers, body = call(port, path="/reglages")
     assert code == 200 and headers["content-type"] == "text/html; charset=utf-8"
-    for section in ("Broker MQTT", "Capteurs", "Température du ciel (MQTT)", "Chauffage", "Interface web"):
+    for section in ("Broker MQTT", "Capteurs", "Température du ciel (MQTT)", "Anticipation (ciel dégagé)", "Chauffage", "Interface web"):
         assert section in body
     assert 'name="HEATER_MARGIN" value="4"' in body  # valeur du fichier
     assert 'type="password"' in body and "au redémarrage" in body

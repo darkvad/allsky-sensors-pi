@@ -244,6 +244,13 @@ def _status_rows(status: Mapping[str, object], now: float) -> str:
     rows.append(_row("Température du dôme", _temperature(status.get("dome_c"))))
     rows.append(_row("Point de rosée", _temperature(status.get("dew_c"))))
     rows.append(_row("Chauffage appliqué", _percent(status.get("duty_pct"))))
+    delta = _number(status.get("sky_delta"))
+    if delta is not None:
+        rows.append(_row("Ciel − air extérieur", _temperature(delta)))
+    anticipation = _number(status.get("anticipation_c"))
+    if anticipation is not None:
+        bonus = "inactive" if anticipation == 0 else f"+{_decimal(anticipation)} °C (ciel dégagé)"
+        rows.append(_row("Anticipation", bonus))
     updated = _number(status.get("updated_at"))
     rows.append(_row("Dernière mise à jour", _age_text(None if updated is None else now - updated)))
     settings = _number(status.get("settings_mtime"))

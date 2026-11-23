@@ -490,6 +490,39 @@ ENV_SCHEMA: tuple[Param, ...] = (
         unit="s",
         help="au-delà, la dernière valeur reçue est ignorée",
     ),
+    Param(
+        "SKY_ANTICIPATION_C",
+        "Anticipation (ciel dégagé)",
+        "Marge ajoutée par ciel dégagé",
+        "float",
+        default="0",
+        minimum=0,
+        maximum=10,
+        unit="°C",
+        help="0 : désactivée ; relève la cible de cette valeur quand ciel − air passe sous le seuil",
+    ),
+    Param(
+        "SKY_CLEAR_DELTA_C",
+        "Anticipation (ciel dégagé)",
+        "Seuil ciel dégagé (ciel − air)",
+        "float",
+        default="-10",
+        minimum=-60,
+        maximum=0,
+        unit="°C",
+        help="ciel considéré dégagé sous ce seuil (ciel bien plus froid que l'air)",
+    ),
+    Param(
+        "SKY_CLEAR_HYSTERESIS_C",
+        "Anticipation (ciel dégagé)",
+        "Hystérésis de retour",
+        "float",
+        default="2",
+        minimum=0,
+        maximum=10,
+        unit="°C",
+        help="retour à la marge nominale au-dessus de seuil + hystérésis (évite le battement)",
+    ),
     Param("HEATER_ENABLED", "Chauffage", "Chauffage activé", "flag", default="0", help="1 pour activer"),
     Param(
         "HEATER_SUPPLY_VOLTS",
@@ -619,6 +652,33 @@ class SkyConfig:
         )
 
 
+@dataclass(frozen=True)
+class SkyAnticipation:
+    """Marge supplémentaire quand le ciel est dégagé (ciel − air sous un seuil).
+
+    Désactivée par défaut (bonus nul) : aucune cible ne change tant que ``SKY_ANTICIPATION_C`` reste
+    à 0. L'hystérésis évite de battre quand un nuage passe : le retour à la marge nominale demande de
+    repasser au-dessus de ``clear_delta_c + hysteresis_c``. Les bornes sont vérifiées par le schéma.
+    """
+
+    bonus_c: float = 0.0
+    clear_delta_c: float = -10.0
+    hysteresis_c: float = 2.0
+
+    @property
+    def enabled(self) -> bool:
+        """Vrai si une marge supplémentaire est demandée."""
+        return self.bonus_c > 0
+
+    @classmethod
+    def from_env(cls, env: Mapping[str, str]) -> SkyAnticipation:
+        return cls(
+            bonus_c=_as_float(env.get("SKY_ANTICIPATION_C"), 0.0),
+            clear_delta_c=_as_float(env.get("SKY_CLEAR_DELTA_C"), -10.0),
+            hysteresis_c=_as_float(env.get("SKY_CLEAR_HYSTERESIS_C"), 2.0),
+        )
+
+
 def configured_env_file(env: Mapping[str, str] | None = None) -> Path | None:
     """Fichier d'environnement à relire, ou None s'il n'y en a pas.
 
@@ -711,6 +771,7 @@ class Settings:
     mqtt: MqttConfig
     state_dir: Path
     sky: SkyConfig = SkyConfig()  # source MQTT de la température du ciel (topic vide = désactivée)
+    anticipation: SkyAnticipation = SkyAnticipation()  # marge supplémentaire par ciel dégagé
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
@@ -739,6 +800,7 @@ class Settings:
             ),
             state_dir=Path(source.get("STATE_DIR", "").strip() or str(STATE_DIR_DEFAULT)),
             sky=SkyConfig.from_env(source),
+            anticipation=SkyAnticipation.from_env(source),
         )
 
 
@@ -955,12 +1017,21 @@ class HeaterController:
         """Cible (°C) du dernier calcul effectif : point de rosée + marge, ou consigne forcée."""
         return self._setpoint
 
-    def update(self, dome: float | None, dew: float | None, now: float, target: float | None = None) -> float:
+    def update(
+        self,
+        dome: float | None,
+        dew: float | None,
+        now: float,
+        target: float | None = None,
+        margin_bonus: float = 0.0,
+    ) -> float:
         """Rapport cyclique à appliquer (entre 0 et ``config.max_duty``).
 
         ``target`` est la consigne d'un forçage : elle remplace (point de rosée + marge) et dispense
-        d'une mesure de point de rosée. Les sécurités restent identiques : sans mesure récente du dôme,
-        ou dôme déjà à ``config.max_dome_temp``, le chauffage est coupé, forçage ou non.
+        d'une mesure de point de rosée. ``margin_bonus`` relève la cible **automatique** d'autant
+        (anticipation par ciel dégagé), sans effet en mode forcé ; la cible reste plafonnée à
+        ``config.max_dome_temp``. Les sécurités restent identiques : sans mesure récente du dôme, ou
+        dôme déjà à ``config.max_dome_temp``, le chauffage est coupé, forçage ou non.
         """
         if dome is not None:
             self._dome, self._dome_at = dome, now
@@ -985,7 +1056,8 @@ class HeaterController:
 
         if target is None:
             assert self._dew is not None
-            self._setpoint = self._dew + self.config.margin
+            bonus = max(margin_bonus, 0.0)
+            self._setpoint = min(self._dew + self.config.margin + bonus, self.config.max_dome_temp)
         else:
             self._setpoint = min(target, self.config.max_dome_temp)  # jamais au-delà de la coupure en surchauffe
         error = self._setpoint - self._dome
@@ -1294,6 +1366,30 @@ def sky_measurement(
     if "sky_temperature" in current or not config.enabled:
         return None
     return feed.reading(now, config.max_age)
+
+
+def sky_delta(
+    readings: Mapping[str, tuple[float, float]], current: Mapping[str, float], now: float
+) -> float | None:
+    """Écart ``ciel − air extérieur``, si les deux mesures sont fraîches (None sinon).
+
+    Sert d'indicateur (``status.json``) et de déclencheur d'anticipation : un ciel clair rayonne et
+    descend bien plus bas que l'air.
+    """
+    sky = readings.get("sky_temperature")
+    air = current.get("outdoor_temperature")
+    if sky is None or air is None or now - sky[1] > STALE_SECONDS:
+        return None
+    return sky[0] - air
+
+
+def anticipation_state(delta: float | None, config: SkyAnticipation, was_clear: bool) -> bool:
+    """Nouvel état « ciel dégagé », avec hystérésis ; une mesure manquante le remet à faux."""
+    if not config.enabled or delta is None:
+        return False
+    if was_clear:
+        return delta <= config.clear_delta_c + config.hysteresis_c
+    return delta <= config.clear_delta_c
 
 
 # --------------------------------------------------------------------------- MQTT
@@ -1662,6 +1758,7 @@ def main() -> int:
     readings: dict[str, tuple[float, float]] = {}  # topic -> (valeur, instant de la mesure)
     last_publish: float | None = None
     duty = 0.0
+    sky_clear = False  # état d'anticipation, avec hystérésis entre les ticks
     override: HeaterOverride | None = None
     warn = WarnOnce()
     unavailable: set[str] = set()
@@ -1722,6 +1819,22 @@ def main() -> int:
             elif "sky_temperature" not in current:
                 readings.pop("sky_temperature", None)  # source périmée : ne pas republier une vieille valeur
 
+            # Anticipation : un ciel dégagé fait rayonner le dôme, on vise un peu plus haut.
+            anticipation = runtime.settings.anticipation
+            delta = sky_delta(readings, current, now)  # toujours calculé : visible dans status.json
+            was_clear = sky_clear
+            sky_clear = anticipation_state(delta, anticipation, sky_clear)
+            if sky_clear != was_clear:
+                if sky_clear:
+                    log.info(
+                        "ciel dégagé (ciel - air = %.1f °C) : marge majorée de %g °C", delta, anticipation.bonus_c
+                    )
+                elif delta is None:
+                    log.info("mesure du ciel ou de l'air perdue : marge nominale")
+                else:
+                    log.info("ciel de nouveau couvert (ciel - air = %.1f °C) : marge nominale", delta)
+            bonus = anticipation.bonus_c if sky_clear else 0.0
+
             override = None
             if runtime.controller and runtime.output:
                 heater = runtime.settings.heater
@@ -1734,6 +1847,7 @@ def main() -> int:
                     current.get("outdoor_dew_point"),
                     now,
                     target=override.target_c if override else None,
+                    margin_bonus=bonus,
                 )
                 runtime.output.set(duty)
                 # état du chauffage publié à chaque tick (10 s) : une interface de pilotage doit être réactive
@@ -1779,6 +1893,8 @@ def main() -> int:
                         "dome_c": current.get("dome_temperature"),
                         "dew_c": current.get("outdoor_dew_point"),
                         "duty_pct": duty * 100,
+                        "sky_delta": delta,
+                        "anticipation_c": bonus,
                         "readings": {topic: value for topic, (value, _at) in readings.items()},
                         "sensors_unavailable": sorted(unavailable),
                         "config_error": config_error,

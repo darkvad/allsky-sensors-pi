@@ -977,6 +977,84 @@ def test_settings_read_the_sky_source():
     assert sensors.Settings.from_env({}).sky.enabled is False
 
 
+# ----------------------------------------------------------------------------- anticipation (ciel dégagé)
+
+
+def test_sky_anticipation_defaults_and_reading():
+    default = sensors.SkyAnticipation.from_env({})
+    assert not default.enabled and default.bonus_c == 0
+    assert default.clear_delta_c == -10 and default.hysteresis_c == 2
+    config = sensors.SkyAnticipation.from_env(
+        {"SKY_ANTICIPATION_C": "2", "SKY_CLEAR_DELTA_C": "-12", "SKY_CLEAR_HYSTERESIS_C": "1,5"}
+    )
+    assert config.enabled and config.bonus_c == 2
+    assert config.clear_delta_c == -12 and config.hysteresis_c == pytest.approx(1.5)
+
+
+def test_sky_delta_needs_fresh_measurements():
+    now = 1000.0
+    readings = {"sky_temperature": (-15.0, now - 5)}
+    assert sensors.sky_delta(readings, {"outdoor_temperature": 2.0}, now) == pytest.approx(-17.0)
+    assert sensors.sky_delta({"sky_temperature": (-15.0, now - 121)}, {"outdoor_temperature": 2.0}, now) is None
+    assert sensors.sky_delta({}, {"outdoor_temperature": 2.0}, now) is None
+    assert sensors.sky_delta(readings, {}, now) is None
+
+
+def test_anticipation_state_uses_hysteresis():
+    config = sensors.SkyAnticipation(bonus_c=2, clear_delta_c=-10, hysteresis_c=2)
+    assert sensors.anticipation_state(-12, config, False) is True
+    assert sensors.anticipation_state(-9, config, False) is False  # pas encore sous le seuil
+    assert sensors.anticipation_state(-9, config, True) is True  # reste dégagé (hystérésis)
+    assert sensors.anticipation_state(-7, config, True) is False  # franchement au-dessus : retour
+    assert sensors.anticipation_state(None, config, True) is False  # mesure perdue : marge nominale
+    assert sensors.anticipation_state(-20, sensors.SkyAnticipation(), False) is False  # désactivé
+
+
+def test_margin_bonus_applies_to_the_automatic_target_only():
+    controller = make(volts=5)
+    controller.update(dome=10.0, dew=5.0, now=0, margin_bonus=2.0)
+    assert controller.setpoint == pytest.approx(5 + 4 + 2)
+    controller.update(dome=10.0, dew=5.0, now=10, target=18.0, margin_bonus=2.0)
+    assert controller.setpoint == pytest.approx(18.0)  # une consigne forcée ignore l'anticipation
+
+
+def test_margin_bonus_never_exceeds_the_overtemperature_cutoff():
+    controller = make(max_dome_temp=35)
+    controller.update(dome=20.0, dew=30.0, now=0, margin_bonus=10.0)
+    assert controller.setpoint == pytest.approx(35.0)
+
+
+def test_anticipation_raises_the_automatic_target(tmp_path, monkeypatch, capsys):
+    code, _ = run_main(monkeypatch, capsys, ["--simulate", "--dry-run", "--once"], heater_env(tmp_path, SKY_ANTICIPATION_C="2"))
+    assert code == 0
+    status = sensors.read_status(tmp_path / "status.json")
+    assert status["target_c"] == pytest.approx(status["dew_c"] + 4 + 2)  # marge + anticipation
+    assert status["anticipation_c"] == pytest.approx(2)
+    assert status["sky_delta"] < -10  # le ciel simulé est bien plus froid que l'air
+
+
+def test_anticipation_is_off_by_default_but_the_delta_is_published(tmp_path, monkeypatch, capsys):
+    code, _ = run_main(monkeypatch, capsys, ["--simulate", "--dry-run", "--once"], heater_env(tmp_path))
+    assert code == 0
+    status = sensors.read_status(tmp_path / "status.json")
+    assert status["target_c"] == pytest.approx(status["dew_c"] + 4)
+    assert status["anticipation_c"] == 0
+    assert status["sky_delta"] is not None  # observable pour régler le seuil, même sans bonus
+
+
+def test_forced_mode_ignores_the_anticipation(tmp_path, monkeypatch, capsys):
+    path = tmp_path / "override.json"
+    sensors.write_override(path, target_c=22.0, minutes=30, now=time.time(), max_target_c=35)
+    keep_override(monkeypatch)
+    code, out = run_main(
+        monkeypatch, capsys, ["--simulate", "--dry-run", "--once"], heater_env(tmp_path, SKY_ANTICIPATION_C="2")
+    )
+    assert code == 0
+    assert float(published(out)["allsky/heater_target"]) == pytest.approx(22.0)
+    status = sensors.read_status(tmp_path / "status.json")
+    assert status["anticipation_c"] == pytest.approx(2)  # l'état reste visible, la consigne reste maîtresse
+
+
 # ----------------------------------------------------------------------------- schéma, validation, réglages
 
 
@@ -1018,6 +1096,12 @@ def test_schema_describes_every_variable_of_the_example_file():
         ("HEATER_ENABLED", "2", False),
         ("MQTT_PORT", "1883", True),
         ("MQTT_PORT", "70000", False),
+        ("SKY_ANTICIPATION_C", "2", True),
+        ("SKY_ANTICIPATION_C", "-1", False),
+        ("SKY_CLEAR_DELTA_C", "-12", True),
+        ("SKY_CLEAR_DELTA_C", "2", False),
+        ("SKY_CLEAR_HYSTERESIS_C", "2", True),
+        ("SKY_CLEAR_HYSTERESIS_C", "20", False),
     ],
 )
 def test_parameter_validation(name, value, valid):
