@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Interface web de l'allsky : état des capteurs et du chauffage, et réglages.
+"""Interface web de l'allsky : état des capteurs et du chauffage, réglages et forçage.
 
 - ``GET /`` : page d'état en français, alimentée par ``status.json`` écrit par ``allsky-sensors``
   (dossier ``STATE_DIR``, soit ``/opt/allsky-sensors/state`` sur la Pi) ; ``GET /sante`` pour la
   supervision (200 si l'état est frais, 503 sinon) ;
 - ``GET /reglages`` : formulaire généré depuis ``ENV_SCHEMA``, enregistré dans ``ENV_FILE``
-  (validation avant écriture, copie ``.bak``), puis appliqué par le service au tick suivant.
+  (validation avant écriture, copie ``.bak``), puis appliqué par le service au tick suivant ;
+- ``GET /chauffage`` : mode, consigne et temps restant, puis formulaires de forçage
+  (``POST /forcer``, ``POST /forcer/annuler``) qui écrivent ``override.json`` ; le service applique
+  la consigne au tick suivant. Forçage refusé si ``HEATER_ENABLED=0``.
 
 Authentification HTTP Basic obligatoire : ``WEB_USER`` et ``WEB_PASSWORD`` (12 caractères au moins,
 sinon le serveur refuse de démarrer). Aucune dépendance nouvelle : la bibliothèque standard suffit, et
@@ -41,6 +44,7 @@ PASSWORD_MIN_LENGTH = 12  # un mot de passe d'interface exposée au réseau loca
 MAX_BODY_BYTES = 64 * 1024  # un formulaire de réglages tient très largement en deçà
 STALE_STATUS_SECONDS = 300  # au-delà, l'état publié n'est plus frais (GET /sante répond alors 503)
 REFRESH_SECONDS = 10  # la page se recharge seule (meta refresh), sans JavaScript
+FORCE_DEFAULT_TARGET_C = 18.0  # consigne proposée dans le formulaire de forçage (°C)
 
 # Libellés des mesures publiées, dans l'ordre d'affichage (les clés inconnues passent à la fin).
 READING_LABELS = {
@@ -301,7 +305,7 @@ def render_page(status: Mapping[str, object] | None, status_file: Path, now: flo
 <body>
 <header>
 <h1>Allsky — capteurs et chauffage</h1>
-<p class="discret">État publié par <code>allsky-sensors</code> · <a href="/reglages">réglages</a> · <a href="/sante">/sante</a> · <a href="/">rafraîchir</a></p>
+<p class="discret">État publié par <code>allsky-sensors</code> · <a href="/chauffage">forçage</a> · <a href="/reglages">réglages</a> · <a href="/sante">/sante</a> · <a href="/">rafraîchir</a></p>
 </header>
 <main>
 {content}
@@ -480,7 +484,7 @@ def render_settings(
 <body>
 <header>
 <h1>Réglages</h1>
-<p class="discret"><code>{html.escape(str(env_file))}</code> · modifié {html.escape(age)} · <a href="/">état</a></p>
+<p class="discret"><code>{html.escape(str(env_file))}</code> · modifié {html.escape(age)} · <a href="/">état</a> · <a href="/chauffage">forçage</a></p>
 </header>
 <main>
 {messages}
@@ -497,6 +501,126 @@ ne changent qu'après un redémarrage du service concerné.</p>
 """
 
 
+
+
+# --------------------------------------------------------------------------- forçage du chauffage
+
+
+def _form_number(text: str) -> float | None:
+    """Nombre saisi dans un formulaire (« 17,5 » accepté), ou None si ce n'est pas un nombre."""
+    try:
+        return float(text.strip().replace(",", "."))
+    except ValueError:
+        return None
+
+
+def _default_target(status: Mapping[str, object] | None) -> str:
+    """Proposition du formulaire : la consigne en cours, sinon une valeur neutre."""
+    forced = _number(status.get("override_target_c")) if status else None
+    value = FORCE_DEFAULT_TARGET_C if forced is None else forced
+    return f"{value:g}".replace(".", ",")
+
+
+def render_heater(
+    status: Mapping[str, object] | None,
+    *,
+    heater: sensors.HeaterConfig | None,
+    heater_error: str | None = None,
+    token: str = "",
+    target: str = "",
+    minutes: str = "",
+    errors: Sequence[str] = (),
+    notice: str | None = None,
+    now: float | None = None,
+    refresh: int = REFRESH_SECONDS,
+) -> str:
+    """Page « Chauffage » : mode, consigne et temps restant, puis formulaires de forçage.
+
+    Les formulaires disparaissent quand le chauffage est désactivé ou sa configuration inutilisable :
+    le refus est alors affiché, et le service refuserait de toute façon d'appliquer la consigne.
+    """
+    current = time.time() if now is None else now
+    if status is None:
+        state = (
+            '<p class="alerte">Aucun état publié : le service <code>allsky-sensors</code> n\'a pas encore '
+            "écrit son état, ou le fichier est illisible.</p>"
+        )
+    else:
+        state = f"<table>{_status_rows(status, current)}</table>"
+
+    messages = ""
+    if errors:
+        items = "".join(f"<li>{html.escape(message)}</li>" for message in errors)
+        messages += f'<div class="alerte"><p>Consigne non enregistrée :</p><ul>{items}</ul></div>'
+    if notice:
+        messages += f'<p class="ok">{html.escape(notice)}</p>'
+
+    if heater is None:
+        if heater_error:
+            reason = f"configuration du chauffage inutilisable ({html.escape(heater_error)})"
+        else:
+            reason = "chauffage désactivé (<code>HEATER_ENABLED=0</code>)"
+        forms = (
+            f'<p class="alerte">Forçage impossible : {reason}. Une consigne ne peut agir que sur un '
+            'chauffage activé : voir les <a href="/reglages">réglages</a>.</p>'
+        )
+    else:
+        target = target or _default_target(status)
+        minutes = minutes or str(sensors.OVERRIDE_DEFAULT_MINUTES)
+        fields = (
+            '<div class="champ">'
+            '<label for="champ-target_c">Température à atteindre (°C)</label>'
+            f'<input id="champ-target_c" type="text" name="target_c" value="{html.escape(target)}" inputmode="decimal">'
+            "</div>"
+            '<div class="champ">'
+            '<label for="champ-minutes">Durée (minutes)</label>'
+            f'<input id="champ-minutes" type="text" name="minutes" value="{html.escape(minutes)}" inputmode="numeric">'
+            "</div>"
+        )
+        token_field = f'<input type="hidden" name="_jeton" value="{html.escape(token)}">'
+        forms = f"""<fieldset><legend>Forcer le chauffage</legend>
+<form method="post" action="/forcer">
+{token_field}
+{fields}
+<button type="submit">Forcer le chauffage</button>
+<p class="aide">Consigne entre {sensors.FORCE_MIN_C:g} et {heater.max_dome_temp:g} °C (plafond
+<code>HEATER_MAX_DOME_TEMP</code>), durée de {sensors.OVERRIDE_MIN_MINUTES} à {sensors.OVERRIDE_MAX_MINUTES} min
+(24 h au plus). Le service applique la consigne au tick suivant ({int(refresh)} s), sans redémarrage.</p>
+</form>
+</fieldset>
+<fieldset><legend>Revenir en automatique</legend>
+<form method="post" action="/forcer/annuler">
+{token_field}
+<button type="submit">Annuler la consigne</button>
+<p class="aide">Supprime la consigne : la cible redevient le point de rosée + <code>HEATER_MARGIN</code>,
+au tick suivant ({int(refresh)} s).</p>
+</form>
+</fieldset>"""
+
+    return f"""<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Allsky — chauffage</title>
+<style>{STYLE}</style>
+</head>
+<body>
+<header>
+<h1>Chauffage — forçage</h1>
+<p class="discret">Consigne lue par <code>allsky-sensors</code> · <a href="/">état</a> ·
+<a href="/reglages">réglages</a> · <a href="/chauffage">rafraîchir</a></p>
+</header>
+<main>
+{messages}
+{state}
+{forms}
+</main>
+<footer><p class="discret">Le compte à rebours se lit sur la page d'état, rafraîchie toutes les
+{int(refresh)} s ; ici, rechargez la page pour l'actualiser.</p></footer>
+</body>
+</html>
+"""
 
 
 # --------------------------------------------------------------------------- application
@@ -540,7 +664,7 @@ class WebApp:
 
 
 class Handler(BaseHTTPRequestHandler):
-    """Routes du socle : ``GET /`` (état) et ``GET /sante`` ; les POST sont contrôlés, sans action."""
+    """Routes : ``GET /`` (état), ``/sante``, ``/reglages``, ``/chauffage`` ; POST contrôlés (jeton)."""
 
     server_version = "allsky-sensors-web"
     sys_version = ""  # ne révèle pas la version de Python dans l'en-tête Server
@@ -644,11 +768,40 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return self.rfile.read(length) if length else b""
 
-    # --- enregistrement des réglages
+    # --- formulaires (contrôles communs aux réglages et au forçage)
 
     def _redirect(self, location: str) -> None:
         """303 après un POST réussi : le navigateur recharge la page en GET (pas de renvoi du formulaire)."""
         self._send(303, b"", "text/plain; charset=utf-8", {"Location": location})
+
+    def _parse_form(self, body: bytes) -> dict[str, list[str]] | None:
+        """Corps du formulaire décodé, ou None si la réponse d'erreur a déjà été envoyée."""
+        content_type = self.headers.get("Content-Type", "").split(";")[0].strip().lower()
+        if content_type != "application/x-www-form-urlencoded":
+            self._page(415, "Format non pris en charge", "Le formulaire doit être envoyé en application/x-www-form-urlencoded.")
+            return None
+        try:
+            text = body.decode("utf-8")
+        except UnicodeDecodeError:
+            self._page(400, "Requête invalide", "Corps du formulaire en UTF-8 attendu.")
+            return None
+        return parse_qs(text, keep_blank_values=True)
+
+    def _form_token_ok(self, params: Mapping[str, list[str]], page: str) -> bool:
+        """Jeton caché du formulaire (HMAC du mot de passe web), comparé en temps constant.
+
+        Une page tierce ne peut pas le lire (même origine oblige) : même si le navigateur de la victime
+        n'annonçait pas d'Origin, elle ne peut pas fabriquer un formulaire valide.
+        """
+        expected = form_token(self.app.config.password)
+        received = params.get("_jeton", [""])[0]
+        if hmac.compare_digest(received.encode("utf-8"), expected.encode("utf-8")):
+            return True
+        log.warning("POST refusé (%s) : jeton de formulaire absent ou invalide", urlsplit(self.path).path)
+        self._page(403, "Requête refusée", f"Formulaire expiré ou d'une autre page : rechargez la page {page}.")
+        return False
+
+    # --- enregistrement des réglages
 
     def _settings_page(
         self,
@@ -679,21 +832,8 @@ class Handler(BaseHTTPRequestHandler):
                 "Aucun fichier de réglages à modifier : ENV_FILE n'est pas défini ou le fichier est introuvable.",
             )
             return
-        content_type = self.headers.get("Content-Type", "").split(";")[0].strip().lower()
-        if content_type != "application/x-www-form-urlencoded":
-            self._page(415, "Format non pris en charge", "Le formulaire doit être envoyé en application/x-www-form-urlencoded.")
-            return
-        try:
-            text = body.decode("utf-8")
-        except UnicodeDecodeError:
-            self._page(400, "Requête invalide", "Corps du formulaire en UTF-8 attendu.")
-            return
-        params = parse_qs(text, keep_blank_values=True)
-        expected = form_token(self.app.config.password)
-        received = params.get("_jeton", [""])[0]
-        if not hmac.compare_digest(received.encode("utf-8"), expected.encode("utf-8")):
-            log.warning("POST refusé (%s) : jeton de formulaire absent ou invalide", urlsplit(self.path).path)
-            self._page(403, "Requête refusée", "Formulaire expiré ou d'une autre page : rechargez la page des réglages.")
+        params = self._parse_form(body)
+        if params is None or not self._form_token_ok(params, "des réglages"):
             return
         env = self.app.read_env()
         changes, submitted = collect_changes(params, env)
@@ -717,6 +857,112 @@ class Handler(BaseHTTPRequestHandler):
         self._redirect(location + ("&redemarrage=1" if restart else ""))
 
 
+    # --- forçage du chauffage
+
+    def _heater_context(self) -> tuple[dict[str, str], sensors.HeaterConfig | None, str | None]:
+        """Réglages effectifs, chauffage (None s'il est désactivé) et motif si la configuration est refusée."""
+        env = self.app.read_env()
+        try:
+            return env, sensors.HeaterConfig.from_env(env), None
+        except ValueError as error:
+            return env, None, str(error)
+
+    def _heater_page(
+        self,
+        *,
+        errors: Sequence[str] = (),
+        notice: str | None = None,
+        target: str = "",
+        minutes: str = "",
+    ) -> None:
+        """Page de forçage : état du chauffage, formulaires (jeton) et messages."""
+        _, heater, heater_error = self._heater_context()
+        body = render_heater(
+            self.app.read_status(),
+            heater=heater,
+            heater_error=heater_error,
+            token=form_token(self.app.config.password),
+            target=target,
+            minutes=minutes,
+            errors=errors,
+            notice=notice,
+            refresh=self.app.refresh,
+        )
+        self._send(200, body, "text/html; charset=utf-8")
+
+    def _require_heater(self) -> tuple[dict[str, str], sensors.HeaterConfig] | None:
+        """Réglages et chauffage actif ; sinon réponse 409 explicite (une consigne serait sans objet)."""
+        env, heater, heater_error = self._heater_context()
+        if heater is not None:
+            return env, heater
+        if heater_error is None:
+            detail = "chauffage désactivé (HEATER_ENABLED=0)"
+        else:
+            detail = f"configuration du chauffage inutilisable : {heater_error}"
+        log.warning("forçage refusé : %s", detail)
+        self._page(
+            409,
+            "Forçage refusé",
+            f"{detail}. Corriger les réglages (/reglages) ou activer le chauffage, puis réessayer.",
+        )
+        return None
+
+    def _save_force(self, body: bytes) -> None:
+        """POST /forcer : écrit override.json, que le service applique au tick suivant."""
+        context = self._require_heater()
+        if context is None:
+            return
+        env, heater = context
+        params = self._parse_form(body)
+        if params is None or not self._form_token_ok(params, "du chauffage"):
+            return
+        target_text = params.get("target_c", [""])[0].strip()
+        minutes_text = params.get("minutes", [""])[0].strip() or str(sensors.OVERRIDE_DEFAULT_MINUTES)
+        target = _form_number(target_text)
+        minutes = _form_number(minutes_text)
+        if target is None:
+            message = (
+                "Température à atteindre manquante (exemple : 18 ou 17,5)."
+                if not target_text
+                else f"Température illisible : « {target_text} » (exemple : 18 ou 17,5)."
+            )
+            self._heater_page(errors=[message], target=target_text, minutes=minutes_text)
+            return
+        if minutes is None:
+            self._heater_page(
+                errors=[f"Durée illisible : « {minutes_text} » (nombre de minutes attendu, par exemple 60)."],
+                target=target_text,
+                minutes=minutes_text,
+            )
+            return
+        path = sensors.override_path(env)
+        try:
+            override = sensors.write_override(path, target, minutes, time.time(), heater.max_dome_temp)
+        except ValueError as error:  # bornes de la consigne ou de la durée : rien n'est écrit
+            self._heater_page(errors=[str(error)], target=target_text, minutes=minutes_text)
+            return
+        except OSError as error:
+            log.error("consigne de forçage non enregistrée dans %s : %s", path, error)
+            self._heater_page(errors=[_write_error(error, path)], target=target_text, minutes=minutes_text)
+            return
+        until = time.strftime("%H:%M", time.localtime(override.expires_at))
+        log.info("forçage du chauffage : %g °C pendant %g min (jusqu'à %s)", override.target_c, minutes, until)
+        self._redirect(f"/chauffage?force={quote(time.strftime('%H:%M:%S'))}")
+
+    def _cancel_force(self, body: bytes) -> None:
+        """POST /forcer/annuler : supprime la consigne, retour à la régulation automatique."""
+        context = self._require_heater()
+        if context is None:
+            return
+        env, _heater = context
+        params = self._parse_form(body)
+        if params is None or not self._form_token_ok(params, "du chauffage"):
+            return
+        path = sensors.override_path(env)
+        removed = sensors.clear_override(path)
+        log.info("consigne de forçage %s (%s)", "annulée" if removed else "déjà absente", path)
+        self._redirect("/chauffage?" + ("annule=1" if removed else "annule=0"))
+
     # --- routes
 
     def do_GET(self) -> None:  # nom imposé par http.server
@@ -729,6 +975,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, body, "text/html; charset=utf-8")
         elif path == "/reglages":
             self._settings_page(notice=self._settings_notice())
+        elif path == "/chauffage":
+            self._heater_page(notice=self._heater_notice())
         elif path == "/sante":
             code, payload = self.app.health()
             self._send(code, json.dumps(payload, ensure_ascii=False, indent=2) + "\n", "application/json; charset=utf-8")
@@ -747,6 +995,20 @@ class Handler(BaseHTTPRequestHandler):
             return "Aucune modification : le fichier n'a pas été réécrit."
         return None
 
+    def _heater_notice(self) -> str | None:
+        """Message affiché après la redirection 303 (forçage enregistré, consigne annulée)."""
+        query = parse_qs(urlsplit(self.path).query)
+        if "force" in query:
+            return (
+                f"Consigne de forçage enregistrée à {query['force'][0]} : "
+                "le service l'applique au tick suivant (10 s)."
+            )
+        if "annule" in query:
+            if query["annule"][0] == "1":
+                return "Consigne annulée : retour à la régulation automatique au tick suivant (10 s)."
+            return "Aucune consigne à annuler : le chauffage est déjà en régulation automatique."
+        return None
+
     def do_POST(self) -> None:
         # L'ordre compte : identifiants, puis origine (anti-CSRF), puis taille du corps.
         if not self._require_auth() or not self._require_origin():
@@ -757,8 +1019,12 @@ class Handler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         if path == "/reglages":
             self._save_settings(body)
-        else:  # le forçage du chauffage se branchera ici à l'étape 6
-            self._page(404, "Action inconnue", "Aucune action n'est encore disponible sur cette page.")
+        elif path == "/forcer":
+            self._save_force(body)
+        elif path == "/forcer/annuler":
+            self._cancel_force(body)
+        else:
+            self._page(404, "Action inconnue", "Aucune action n'est disponible à cette adresse.")
 
     def log_message(self, format: str, *args: object) -> None:  # signature imposée par http.server
         log.info("%s %s", self.address_string(), format % args)

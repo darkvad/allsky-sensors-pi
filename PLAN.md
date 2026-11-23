@@ -39,12 +39,12 @@ Deux fonctionnalités demandées :
 - consigne expirée → fichier supprimé, retour en automatique ; fichier inexploitable → conservé, motif journalisé ;
 - supprimé au démarrage du service et si `HEATER_ENABLED=0` (un redémarrage repart toujours en automatique).
 
-### `status.json` (étape 3 ⏳)
+### `status.json` (étape 3 ✅)
 
 ```json
-{"updated_at": 0.0, "mode": "auto", "target_c": null, "override_expires_at": null,
- "dome_c": 9.5, "dew_c": -2.3, "duty_pct": 0.0, "readings": {}, "sensors_unavailable": [],
- "config_error": null, "settings_mtime": 0.0, "pid": 0}
+{"updated_at": 0.0, "mode": "auto", "target_c": null, "override_target_c": null,
+ "override_expires_at": null, "dome_c": 9.5, "dew_c": -2.3, "duty_pct": 0.0, "readings": {},
+ "sensors_unavailable": [], "config_error": null, "settings_mtime": 0.0, "pid": 0}
 ```
 
 ### Commandes de forçage (étape 1 ✅)
@@ -98,7 +98,7 @@ défaut `/etc/allsky-sensors/allsky-sensors.env`) est lu par la commande, donc e
 | 3 | Cœur : rechargement à chaud | ✅ **terminé** | mtime + `Settings` reconstruits ; version **déployée sur la Pi** (état chauffage publié toutes les 10 s, constaté le 22/11) ; rechargement lui-même à déclencher à la main |
 | 4 | Web : socle (serveur, authentification, page d'état) | ✅ **terminé** | `web_api.py` + unité durcie ; 26 tests dans `tests/test_web_api.py` (serveur réel sur le port 0), 183 verts au total |
 | 5 | Web : formulaire de réglages | ✅ **terminé** | formulaire depuis `ENV_SCHEMA`, `POST /reglages` (303) + jeton anti-CSRF, 46 tests web, 203 verts au total |
-| 6 | Web : commandes de forçage | ⏳ à faire | |
+| 6 | Web : commandes de forçage | ✅ **terminé** | `/chauffage`, `POST /forcer` et `POST /forcer/annuler` ; 70 tests dans `tests/test_web_api.py`, 227 verts au total ; chaîne vérifiée en direct le 23/11 (`override.json` → `heater_mode force`, `status.json` `mode force` cible 18,0, puis `auto` après annulation) |
 | 7 | Déploiement, doc, README | ⏳ à faire | |
 
 ## 5. Détail des étapes
@@ -424,17 +424,73 @@ ordre et secrets conservés, `.bak` identique à l'ancien) ; service relancé av
 Critères tenus : hors bornes → fichier intact ; enregistrement valide → commentaires et ordre conservés ;
 aucun changement → fichier non réécrit (donc pas de rechargement inutile).
 
-### Étape 6 — Web : commandes de forçage ⏳
+### Étape 6 — Web : commandes de forçage ✅
 
-À livrer : `POST /forcer` (`target_c`, `minutes`, bornés par `HEATER_MAX_DOME_TEMP`, 5 min à 24 h),
-`POST /forcer/annuler`, refus explicite si `HEATER_ENABLED=0`, affichage du mode, de la consigne et
-du temps restant ; écriture via `write_override`. Les deux formulaires portent le jeton `_jeton` de
-l'étape 5 (même contrôle anti-CSRF, même redirection 303).
+Livré dans `web_api.py` :
 
-Critères : forçage visible dans `status.json`/MQTT au tick suivant ; consigne > `HEATER_MAX_DOME_TEMP`
-refusée avec message clair ; annulation → retour `auto` immédiat.
+- `GET /chauffage` : mode, cible, consigne forcée et **temps restant** (même tableau que la page
+  d'état), formulaire « Forcer le chauffage » (`target_c` et `minutes`, consigne en cours proposée)
+  et formulaire « Annuler la consigne » ; liens depuis `/` et `/reglages` ;
+- `POST /forcer` : mêmes contrôles que `/reglages` (Basic auth, `Origin`/`Referer` quand ils sont
+  annoncés, `_jeton` comparé en temps constant, `application/x-www-form-urlencoded`, corps ≤ 64 Kio) ;
+  virgule décimale acceptée, durée vide = 60 min ; bornes de `write_override` (consigne entre
+  `FORCE_MIN_C` et `HEATER_MAX_DOME_TEMP`, durée de 5 min à 24 h) ; en cas de refus, **rien n'est
+  écrit** et la saisie est réaffichée avec le message ;
+- `POST /forcer/annuler` : `clear_override`, message « consigne annulée » ou « aucune consigne à
+  annuler » ;
+- **refus explicite (409)** si `HEATER_ENABLED=0`, ou si la configuration du chauffage est
+  inutilisable (tension absente, GPIO réservé…) : la page `/chauffage` retire alors les formulaires
+  et affiche le motif ;
+- écriture dans `STATE_DIR/override.json` par `sensors.write_override` (atomique, 0600) : le service
+  l'applique au tick suivant (≤ 10 s), sans redémarrage ; un `EROFS`/`EACCES` affiche le même
+  diagnostic que `/reglages` (`ReadWritePaths`, propriétaire du dossier) ;
+- redirection **303** vers `/chauffage?force=HH:MM:SS`, `?annule=1` ou `?annule=0` ; la valeur lue
+  dans l'URL est échappée comme le reste de la page ; le compte à rebours (`encore 42 min`) est
+  celui de la page d'état, rafraîchie toutes les 10 s ;
+- rien n'est dupliqué : `_parse_form()` et `_form_token_ok()` sont partagés avec `/reglages` (même
+  jeton, même message « rechargez la page »).
 
-**Tester (sera précisé en fin d'étape).**
+**Tester (sans matériel, sous Windows) :**
+
+```powershell
+python -m pytest -q tests/test_web_api.py     # 70 tests, serveur réel sur le port 0
+```
+
+Chaîne complète, service simulé et interface en parallèle (deux terminaux) :
+
+```powershell
+$demo = Join-Path $env:TEMP 'allsky-etape6'
+New-Item -ItemType Directory -Force $demo | Out-Null
+@"
+ENABLED=bme280,ds18b20
+INTERVAL=60
+HEATER_ENABLED=1
+HEATER_SUPPLY_VOLTS=12
+STATE_DIR=$demo
+WEB_USER=admin
+WEB_PASSWORD=mot-de-passe-de-test
+"@ | Set-Content -Encoding utf8 (Join-Path $demo 'allsky-sensors.env')
+
+$env:ENV_FILE = Join-Path $demo 'allsky-sensors.env'
+python allsky_sensors_mqtt.py --simulate --dry-run      # terminal 1 : publie l'état chauffage
+python web_api.py --bind 127.0.0.1 --port 8080          # terminal 2 : interface
+```
+
+Attendu : `http://127.0.0.1:8080/chauffage` affiche « Automatique », la cible et le formulaire
+(18 °C / 60 min). Forcer **18 °C / 30 min** → 303 vers `/chauffage?force=…`, `override.json` écrit
+(`18.0`, `expires_at − created_at = 1800 s`), puis au tick suivant `allsky/heater_mode force`,
+`allsky/heater_target 18.00` et `status.json` avec `mode: "force"`, `override_target_c: 18.0`.
+« Annuler la consigne » → `override.json` supprimé, `allsky/heater_mode auto`.
+
+Vérifié le 23/11 sur la chaîne réelle (démon + serveur HTTP dans le même essai) : `GET /chauffage`
+200 avec formulaires, `POST /forcer` 303, `override.json` `18.0 °C / 30 min`, `status.json`
+`mode force` cible `18.0` au tick suivant, `POST /forcer/annuler` 303 → fichier supprimé et
+`mode auto`.
+
+Critères tenus : consigne > `HEATER_MAX_DOME_TEMP` (40 °C) et durée hors bornes (2 min, 1500 min)
+refusées avec message clair et sans écriture ; `HEATER_ENABLED=0` → 409 ; jeton absent ou invalide
+et origine étrangère → 403 ; annulation → retour `auto` au tick suivant.
+
 
 ### Étape 7 — Déploiement et documentation ⏳
 
@@ -905,15 +961,30 @@ formulaire `/reglages` qui écrit `/etc/allsky-sensors/allsky-sensors.env` (jeto
   permission d'écriture va dans l'unité de la Pi (le message de `/reglages` la nomme) ;
 - `Referrer-Policy: same-origin` et jeton `_jeton` : les deux sont liés (voir incidents du 22/11).
 
-**État du dépôt** : modifications non commitées (`.gitignore`, `allsky-sensors.env.example`,
-`allsky-sensors.service`, `allsky_sensors_mqtt.py`, `README.md`, `tests/test_allsky_sensors.py`) et
-fichiers nouveaux (`web_api.py`, `allsky-sensors-web.service`, `tests/test_web_api.py`, `PLAN.md`).
-Aucun commit, aucun push. `pytest` : 203 passés, 2 ignorés, 1 échec `AF_UNIX` pré-existant sous Windows ;
-`ruff` : OK.
+**État du dépôt** : les étapes 1 à 5 sont **commitées localement** (`2f7e155`, « Forçage du chauffage,
+rechargement à chaud et interface web ») ; aucun push n'a été fait (règle `agents.md`). L'étape 6 est
+livrée dans l'arbre de travail (`web_api.py`, `tests/test_web_api.py`, ce document), pas encore commitée.
+`pytest` : 227 passés, 2 ignorés (gpiozero absent sous Windows), 1 échec `AF_UNIX` pré-existant sous
+Windows ; `ruff` : OK.
 
-**Prochaine session** : étape 6 — forçage du chauffage depuis le web (`POST /forcer`,
-`POST /forcer/annuler`, jeton `_jeton`, écriture `override.json`, refus si `HEATER_ENABLED=0`, compte à
-rebours affiché). Puis l'étape 7 (déploiement/documentation) et, si le besoin se confirme, la température
-du ciel par MQTT ci-dessus.
+### Étape 6 livrée (23/11)
+
+- `GET /chauffage` : mode, cible, consigne et temps restant, formulaire de forçage (`target_c`,
+  `minutes`) et formulaire d'annulation ; la page d'état et `/reglages` y renvoient ;
+- `POST /forcer` / `POST /forcer/annuler` : mêmes contrôles que `/reglages` (Basic auth, `Origin`
+  quand annoncé, jeton `_jeton`, formulaire urlencodé), écriture de `STATE_DIR/override.json` par
+  `write_override` (bornes `FORCE_MIN_C`…`HEATER_MAX_DOME_TEMP`, 5 min à 24 h), 303 vers
+  `/chauffage` ; refus **409** si `HEATER_ENABLED=0` ou configuration du chauffage inutilisable ;
+- vérifié en direct : `override.json` `18 °C / 30 min` → `allsky/heater_mode force`,
+  `allsky/heater_target 18.00` et `status.json` `mode force` au tick suivant ; annulation → fichier
+  supprimé et `mode auto` ;
+- 24 tests ajoutés (70 dans `tests/test_web_api.py`), dont : jeton absent/invalide, origine
+  étrangère, 40 °C refusé, durées 2 et 1500 min refusées, virgule décimale, chauffage désactivé,
+  configuration sans tension, écriture `EROFS`, échappement du message de redirection.
+
+**Prochaine session** : étape 7 — déploiement et documentation (README : interface web et sécurité,
+chapitre forçage, installation des deux unités, topics d'état ; compte de tests à jour), puis
+`ReadWritePaths` déjà en place pour `STATE_DIR` sur la Pi. Ensuite, si le besoin se confirme, la
+température du ciel par MQTT ci-dessus.
 
 
