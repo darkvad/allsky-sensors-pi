@@ -1114,6 +1114,18 @@ Windows ; `ruff` : OK.
 - vérifié sous Git Bash : `--dry-run --non-interactive` sans erreur, `.env` généré et
   `validate_env` → `[]`.
 
+### Release 1.0.0 (23/11)
+
+- tag `v1.0.0` et release GitHub : https://github.com/darkvad/allsky-sensors-pi/releases/tag/v1.0.0
+  (non-draft, « latest ») ;
+- assets : `install.sh` (mode 755), `allsky-sensors-pi-1.0.0.tar.gz` (23 fichiers) et `SHA256SUMS` ;
+- dépôt rendu **public** : les assets se téléchargent sans authentification (HTTP 200 vérifié) ;
+- parcours anonyme vérifié : téléchargement des trois assets, `sha256sum -c` → `OK`,
+  `install.sh --version` → `1.0.0` ; `install.sh` de la release télécharge l'archive et vérifie sa
+  somme avant extraction ;
+- commit local non poussé (support `GITHUB_TOKEN` pour un fork privé, doc) ; la release 1.0.0 reste
+  celle de `45101fe`.
+
 **Prochaine session** : déployer l'étape 7 sur la Pi (`git pull && sudo ./install.sh --upgrade`, ou
 `./install.sh` pour une réinstallation complète), puis régler `SKY_ANTICIPATION_C` sur des nuits
 réelles. Rien d'autre n'est planifié.

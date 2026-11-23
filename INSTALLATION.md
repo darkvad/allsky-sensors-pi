@@ -25,6 +25,10 @@ sudo bash install.sh
 - `--local` refuse le téléchargement et exige les fichiers à côté du script ;
 - `--version` affiche la version de l'installateur.
 
+> Le dépôt est public : les URLs de release se téléchargent sans authentification. Si tu forkes le
+> projet en privé, crée un jeton (scope `repo`) et lance `sudo env GITHUB_TOKEN=ghp_… bash install.sh` ;
+> le script l'utilise pour l'archive et `SHA256SUMS` (le jeton n'est jamais journalisé).
+
 Pour une mise à jour : télécharger l'`install.sh` de la nouvelle release, puis
 `sudo bash install.sh --upgrade` (le `.env` est conservé).
 

@@ -376,9 +376,14 @@ install_packages() {
 # du dépôt (téléchargé depuis la page Releases). Vérifie la somme SHA256 avant toute extraction.
 fetch_release() {
     local archive url
+    local -a auth=()
     summary_header "release v$RELEASE_VERSION"
     command -v curl >/dev/null 2>&1 || die "curl est requis pour télécharger la release"
     command -v tar >/dev/null 2>&1 || die "tar est requis pour extraire la release"
+    if [[ -n ${GITHUB_TOKEN-} ]]; then
+        auth=(--header "Authorization: Bearer $GITHUB_TOKEN")
+        log "téléchargement authentifié avec GITHUB_TOKEN"
+    fi
     RELEASE_TMP=$(mktemp -d)
     archive="$RELEASE_TMP/allsky-sensors-pi-$RELEASE_VERSION.tar.gz"
     url="$RELEASE_BASE/v$RELEASE_VERSION/allsky-sensors-pi-$RELEASE_VERSION.tar.gz"
@@ -389,14 +394,14 @@ fetch_release() {
         SCRIPT_DIR=$RELEASE_TMP
         return 0
     fi
-    curl --fail --location --silent --show-error --max-time 300 --retry 2 --output "$archive" "$url" \
-        || die "téléchargement impossible : $url (release inexistante ? réseau ?)"
+    curl "${auth[@]}" --fail --location --silent --show-error --max-time 300 --retry 2 --output "$archive" "$url" \
+        || die "téléchargement impossible : $url (release inexistante, dépôt privé sans GITHUB_TOKEN, ou réseau)"
     if [[ $VERIFY_RELEASE -eq 1 ]]; then
         command -v sha256sum >/dev/null 2>&1 || die "sha256sum est requis pour vérifier la release (ou --no-verify)"
-        curl --fail --location --silent --show-error --max-time 60 \
+        curl "${auth[@]}" --fail --location --silent --show-error --max-time 60 \
             --output "$RELEASE_TMP/SHA256SUMS" \
             "$RELEASE_BASE/v$RELEASE_VERSION/SHA256SUMS" \
-            || die "SHA256SUMS introuvable pour la release v$RELEASE_VERSION"
+            || die "SHA256SUMS introuvable pour la release v$RELEASE_VERSION (dépôt privé sans GITHUB_TOKEN ?)"
         if ! grep -qE "  allsky-sensors-pi-$RELEASE_VERSION\.tar\.gz$" "$RELEASE_TMP/SHA256SUMS"; then
             die "SHA256SUMS ne mentionne pas allsky-sensors-pi-$RELEASE_VERSION.tar.gz"
         fi

@@ -86,6 +86,9 @@ sudo bash install.sh
 L'installateur télécharge l'archive de la release, **vérifie son SHA256**, l'extrait dans un dossier
 temporaire et installe cette version. `--release X.Y.Z` installe une autre release.
 
+> Le dépôt est public : ces URLs se téléchargent sans authentification. Si tu forkes le projet en
+> privé, utilise un jeton : `sudo env GITHUB_TOKEN=ghp_… bash install.sh`.
+
 **Depuis le dépôt** (développement, mises à jour par `git pull`) :
 
 ```bash
