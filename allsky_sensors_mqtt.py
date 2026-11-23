@@ -41,6 +41,7 @@ from pathlib import Path
 log = logging.getLogger("allsky-sensors")
 
 PREFIX = os.getenv("MQTT_PREFIX", "allsky")
+VERSION = "1.0.0"  # version du projet ; publiée dans les journaux, l'interface et les releases GitHub
 DEFAULT_SENSORS = "bme280,ds18b20"  # capteurs lus si ENABLED n'est pas défini
 # Capteurs (variable ENABLED) et topics qu'ils publient, dans l'ordre de publication.
 # Le dernier élément du topic sert de nom dans indi-allsky : il doit être distinct d'un topic à l'autre.
@@ -1652,6 +1653,7 @@ def close_runtime(runtime: Runtime) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
+    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     parser.add_argument("--once", action="store_true", help="une seule série de mesures, puis quitter")
     parser.add_argument("--dry-run", action="store_true", help="afficher les valeurs au lieu de les publier (GPIO inactif)")
     parser.add_argument("--simulate", action="store_true", help="valeurs simulées, sans matériel (GPIO inactif)")
@@ -1682,6 +1684,7 @@ def main() -> int:
         return 0
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    log.info("allsky-sensors %s", VERSION)
 
     if args.heater_test is not None:
         return heater_test_command(args.heater_test, args.heater_test_seconds)

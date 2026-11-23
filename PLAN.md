@@ -107,7 +107,7 @@ défaut `/etc/allsky-sensors/allsky-sensors.env`) est lu par la commande, donc e
 | 6 | Web : commandes de forçage | ✅ **terminé** | `/chauffage`, `POST /forcer` et `POST /forcer/annuler` ; 70 tests dans `tests/test_web_api.py`, 227 verts au total ; chaîne vérifiée en direct le 23/11 (`override.json` → `heater_mode force`, `status.json` `mode force` cible 18,0, puis `auto` après annulation) |
 | 6b | Cœur : température du ciel par MQTT (SQMeter) | ✅ **terminé** | `SKY_*`, `SkyConfig`, `read_sky_payload`, `SkyFeed` ; 20 tests ajoutés (247 verts au total) ; message du SQMeter → `allsky/sky_temperature 23.9` et `status.json` vérifiés |
 | 6c | Cœur : anticipation par ciel dégagé | ✅ **terminé** | `SKY_ANTICIPATION_C`/`SKY_CLEAR_*`, `sky_delta`, hystérésis, `margin_bonus` du régulateur ; 16 tests ajoutés (263 verts au total) ; vérifié : `ciel − air = −41,4 °C` → cible 21,0 (rosée 15 + marge 4 + 2) |
-| 7 | Déploiement, doc, README | ⏳ à faire | |
+| 7 | Déploiement, doc, script d'installation | ✅ **terminé** | `install.sh` (questions, validation du `.env`, permissions, unités, I2C/1-Wire), `INSTALLATION.md`, README refondu ; 5 tests (syntaxe bash + `.env` généré), 268 verts au total |
 
 ## 5. Détail des étapes
 
@@ -500,17 +500,60 @@ refusées avec message clair et sans écriture ; `HEATER_ENABLED=0` → 409 ; je
 et origine étrangère → 403 ; annulation → retour `auto` au tick suivant.
 
 
-### Étape 7 — Déploiement et documentation ⏳
+### Étape 7 — Déploiement, documentation et script d'installation ✅
 
-À livrer : `allsky-sensors.service` (`Environment=ENV_FILE=`, `StateDirectory=allsky-sensors`),
-`allsky-sensors.env.example` (section « Interface web »), README (interface web et sécurité :
-réseau local uniquement, mot de passe fort, tunnel SSH ; chapitre forçage ; sécurités ; installation
-des deux unités ; `--print-topics` et topics d'état ; nombre de tests à jour), `agents.md` inchangé.
+Livré :
 
-Critères : installation décrite de bout en bout sur une Pi vierge ; `pytest` et `ruff` verts ;
-aucun secret dans le dépôt.
+- **`install.sh`** (bash, `set -euo pipefail`, idempotent) :
+  - questions interactives (broker, capteurs, MLX ou SQMeter, anticipation, chauffage, interface web),
+    avec valeurs par défaut et validation par champ ; `--non-interactive` lit les réponses dans
+    l'environnement ;
+  - génération du `.env` (`MQTT_*`, `SKY_*`, `HEATER_*`, `WEB_*`), **validation par le programme**
+    (`validate_env`) avant écriture, fichier en 600, sauvegarde `.bak-…` d'une ancienne configuration ;
+  - `/opt/allsky-sensors` (755), `state/` (700), `doc/`, venv et dépendances Python (en tant que compte
+    du service), copie des programmes et de la documentation ;
+  - unités systemd avec `User=` substitué, `daemon-reload`, `enable --now` (ou `restart` en
+    `--upgrade`), vérification `is-active` et journal en cas d'échec ;
+  - groupes `i2c`/`gpio`/`spi`, activation d'I2C et 1-Wire (`raspi-config nonint`, ou `config.txt` avec
+    sauvegarde), avertissement de redémarrage ;
+  - options `--upgrade`, `--uninstall` (sauvegarde du `.env` dans `/root`), `--dry-run`, `--keep-config`,
+    `--no-services`, `--no-packages`, `--no-boot-config`, `--recreate-venv`, `--user`, `--prefix`,
+    `--config-dir` ;
+  - **mode release** : lancé hors du dépôt, il télécharge `allsky-sensors-pi-<version>.tar.gz` depuis
+    les releases GitHub, vérifie `SHA256SUMS`, extrait dans un dossier temporaire (chemins absolus
+    refusés) puis installe ; `--release X.Y.Z`, `--local`, `--no-verify` ;
+  - `VERSION = 1.0.0` partagée par le programme, l'interface (`/sante`, pages) et l'installateur ;
+  - les mots de passe ne sont jamais journalisés ; s'ils sont vides, l'interface web en reçoit un
+    généré (affiché une fois).
+- **`INSTALLATION.md`** : prérequis, questions, options, après-installation, mise à jour, sauvegarde,
+  désinstallation, dépannage, fichiers installés, sécurité, migration d'une installation manuelle.
+- **`README.md`** refondu : fonctionnalités actuelles (263 tests), topics d'état, installation par le
+  script, interface web, forçage, anticipation, mise à jour/désinstallation, développement.
+- **`tests/test_install_script.py`** : script en LF, invariants de sécurité, `bash -n` (Git Bash sous
+  Windows, bash sous Linux) et **rendu réel du `.env`** (chauffage activé/désactivé) validé par
+  `validate_env` ; la version de l'installateur doit égaler `sensors.VERSION`.
+- **`CHANGELOG.md`** : version 1.0.0.
 
-**Tester (sera précisé en fin d'étape).**
+**Tester (sans matériel) :**
+
+```powershell
+python -m pytest -q tests/test_install_script.py     # 5 tests
+python -m pytest -q                                  # suite complète
+```
+
+Sur une Pi vierge :
+
+```bash
+git clone https://github.com/darkvad/allsky-sensors-pi.git
+cd allsky-sensors-pi
+sudo ./install.sh --dry-run          # relit les questions, n'écrit rien
+sudo ./install.sh                    # installation réelle
+journalctl -u allsky-sensors -f
+```
+
+Critères tenus : configuration invalide refusée **avant** toute écriture ; `.env` en 600 ; services
+actifs ; I2C/1-Wire proposés ; `--upgrade` ne touche pas au `.env` ; aucun secret dans le dépôt.
+
 
 ## 6. Sécurités à ne jamais contourner
 
@@ -1054,12 +1097,26 @@ formulaire `/reglages` qui écrit `/etc/allsky-sensors/allsky-sensors.env` (jeto
   permission d'écriture va dans l'unité de la Pi (le message de `/reglages` la nomme) ;
 - `Referrer-Policy: same-origin` et jeton `_jeton` : les deux sont liés (voir incidents du 22/11).
 
-**État du dépôt** : les étapes 1 à 6 sont **commitées et poussées** (`dfae436` pour l'étape 6,
-`0391e9b` pour la température du ciel par MQTT). L'anticipation par ciel dégagé est livrée dans
-l'arbre de travail (`allsky_sensors_mqtt.py`, `web_api.py`, tests, exemple d'environnement, README,
-ce document), pas encore commitée.
-`pytest` : 263 passés, 2 ignorés (gpiozero absent sous Windows), 1 échec `AF_UNIX` pré-existant sous
+**État du dépôt** : les étapes 1 à 6, la température du ciel par MQTT et l'anticipation sont
+**commitées et poussées** (`0391e9b`, `98ac2e8`). L'étape 7 (`install.sh`, `INSTALLATION.md`, `README.md`,
+`tests/test_install_script.py`, ce document) est livrée dans l'arbre de travail, pas encore commitée.
+`pytest` : 268 passés, 2 ignorés (gpiozero absent sous Windows), 1 échec `AF_UNIX` pré-existant sous
 Windows ; `ruff` : OK.
+
+### Étape 7 livrée (23/11)
+
+- `install.sh` : questions, validation du `.env` par le programme avant écriture, permissions,
+  unités systemd, groupes et I2C/1-Wire ; `--upgrade`/`--uninstall`/`--dry-run`/`--non-interactive` ;
+- `INSTALLATION.md` (guide détaillé) et README refondu (fonctionnalités, topics d'état, interface
+  web, forçage, anticipation, mise à jour) ;
+- 5 tests ajoutés (syntaxe bash via Git Bash/bash, invariants de sécurité, **rendu réel du `.env`**
+  validé par `validate_env`, chauffage activé et désactivé) ;
+- vérifié sous Git Bash : `--dry-run --non-interactive` sans erreur, `.env` généré et
+  `validate_env` → `[]`.
+
+**Prochaine session** : déployer l'étape 7 sur la Pi (`git pull && sudo ./install.sh --upgrade`, ou
+`./install.sh` pour une réinstallation complète), puis régler `SKY_ANTICIPATION_C` sur des nuits
+réelles. Rien d'autre n'est planifié.
 
 ### Étape 6 livrée (23/11)
 
@@ -1109,8 +1166,7 @@ que le service) ; le MLX90614 du SQMeter est la seule source utile (`infrared.sk
 - à faire sur la Pi : observer `sky_delta` quelques nuits (ciel clair / couvert) avant d'activer
   `SKY_ANTICIPATION_C` (1 à 3 °C), puis surveiller le journal.
 
-**Prochaine session** : étape 7 — déploiement et documentation (README : interface web et sécurité,
-chapitre forçage, température du ciel par MQTT, anticipation, installation des deux unités, topics
-d'état ; compte de tests à jour), puis `ReadWritePaths` déjà en place pour `STATE_DIR` sur la Pi.
+**Prochaine session** : déployer l'étape 7 sur la Pi (`git pull && sudo ./install.sh --upgrade`), puis
+régler `SKY_ANTICIPATION_C` sur des nuits réelles. Rien d'autre n'est planifié.
 
 

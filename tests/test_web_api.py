@@ -230,6 +230,15 @@ def test_sante_sans_fichier(serveur):
     assert json.loads(body)["mise_a_jour_s"] is None
 
 
+def test_version_exposee_dans_sante_et_les_pages(serveur):
+    _, port, _ = serveur
+    _, _, body = call(port, path="/sante")
+    assert json.loads(body)["version"] == sensors.VERSION
+    assert f"v{sensors.VERSION}" in call(port)[2]
+    assert f"v{sensors.VERSION}" in call(port, path="/chauffage")[2]
+    assert f"v{sensors.VERSION}" in call(port, path="/reglages")[2]
+
+
 # ----------------------------------------------------------------------------- POST (socle)
 
 

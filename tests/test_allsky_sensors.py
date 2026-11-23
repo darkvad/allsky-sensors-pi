@@ -15,6 +15,13 @@ from allsky_sensors_mqtt import HeaterConfig, HeaterController
 W1_OK = "72 01 4b 46 7f ff 0e 10 57 : crc=57 YES\n72 01 4b 46 7f ff 0e 10 57 t=23125\n"
 
 
+def test_version_is_semver():
+    """La version publiée dans les journaux et les releases est une version à trois nombres."""
+    parts = sensors.VERSION.split(".")
+    assert len(parts) == 3 and all(part.isdigit() for part in parts)
+
+
+
 def test_dew_point():
     assert sensors.dew_point(20, 50) == pytest.approx(9.26, abs=0.01)
     assert sensors.dew_point(5, 100) == pytest.approx(5.0, abs=0.01)

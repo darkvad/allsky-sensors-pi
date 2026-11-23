@@ -39,6 +39,7 @@ from urllib.parse import parse_qs, quote, urlsplit
 import allsky_sensors_mqtt as sensors
 
 log = logging.getLogger("allsky-sensors-web")
+VERSION = sensors.VERSION  # même version que le service : affichée dans les pages et /sante
 
 PASSWORD_MIN_LENGTH = 12  # un mot de passe d'interface exposée au réseau local, pas un code PIN
 MAX_BODY_BYTES = 64 * 1024  # un formulaire de réglages tient très largement en deçà
@@ -317,7 +318,7 @@ def render_page(status: Mapping[str, object] | None, status_file: Path, now: flo
 <main>
 {content}
 </main>
-<footer><p class="discret">Page rafraîchie toutes les {int(refresh)} s.</p></footer>
+<footer><p class="discret">Page rafraîchie toutes les {int(refresh)} s · allsky-sensors v{VERSION}</p></footer>
 </body>
 </html>
 """
@@ -329,7 +330,7 @@ def render_message(title: str, text: str = "") -> str:
     return f"""<!doctype html>
 <html lang="fr">
 <head><meta charset="utf-8"><title>{html.escape(title)}</title><style>{STYLE}</style></head>
-<body><h1>{html.escape(title)}</h1>{body}</body>
+<body><h1>{html.escape(title)}</h1>{body}<p class="discret">allsky-sensors v{VERSION}</p></body>
 </html>
 """
 
@@ -491,7 +492,7 @@ def render_settings(
 <body>
 <header>
 <h1>Réglages</h1>
-<p class="discret"><code>{html.escape(str(env_file))}</code> · modifié {html.escape(age)} · <a href="/">état</a> · <a href="/chauffage">forçage</a></p>
+<p class="discret"><code>{html.escape(str(env_file))}</code> · modifié {html.escape(age)} · <a href="/">état</a> · <a href="/chauffage">forçage</a> · v{VERSION}</p>
 </header>
 <main>
 {messages}
@@ -616,7 +617,7 @@ au tick suivant ({int(refresh)} s).</p>
 <header>
 <h1>Chauffage — forçage</h1>
 <p class="discret">Consigne lue par <code>allsky-sensors</code> · <a href="/">état</a> ·
-<a href="/reglages">réglages</a> · <a href="/chauffage">rafraîchir</a></p>
+<a href="/reglages">réglages</a> · <a href="/chauffage">rafraîchir</a> · v{VERSION}</p>
 </header>
 <main>
 {messages}
@@ -665,6 +666,7 @@ class WebApp:
             "mode": status.get("mode") if status else None,
             "config_error": status.get("config_error") if status else None,
             "pid": status.get("pid") if status else None,
+            "version": VERSION,
             "fichier": str(self.status_file),
         }
         return (200 if healthy else 503), payload
@@ -1052,6 +1054,7 @@ class WebServer(ThreadingHTTPServer):
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
+    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     parser.add_argument("--bind", help="adresse d'écoute (défaut : WEB_BIND, sinon 0.0.0.0)")
     parser.add_argument("--port", type=int, help="port d'écoute (défaut : WEB_PORT, sinon 8080)")
     parser.add_argument("--status-file", type=Path, help="état publié par le service (défaut : STATE_DIR/status.json)")
@@ -1077,7 +1080,7 @@ def main() -> int:
     except OSError as error:
         log.error("%s", error)
         return 2
-    log.info("interface web à l'écoute sur http://%s:%s (utilisateur %s)", config.bind, config.port, config.user)
+    log.info("interface web %s à l'écoute sur http://%s:%s (utilisateur %s)", VERSION, config.bind, config.port, config.user)
     log.info("état lu dans %s ; réglages dans %s", status_file, env_file or "aucun")
     try:
         server.serve_forever()

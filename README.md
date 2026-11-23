@@ -1,9 +1,11 @@
 # Capteurs et chauffage anti-buée de l'allsky, via MQTT
 
-Programme pour la Raspberry Pi de l'allsky (testé sans matériel : simulation, vrai broker Mosquitto, 57 tests). Il :
-1. lit un BME280 (extérieur), un DS18B20 (dôme) et un MLX90614 (température du ciel), calcule le point de rosée ;
-2. régule un chauffage anti-buée : température du dôme = point de rosée + marge ;
-3. publie tout sur MQTT, y compris le rapport cyclique PWM appliqué.
+Version **1.0.0** · [journal des versions](CHANGELOG.md)
+
+Programme pour la Raspberry Pi de l'allsky (263 tests, simulation et vrai broker Mosquitto). Il :
+1. lit un BME280 (extérieur), un DS18B20 (dôme) et, au choix, un MLX90614 local ou la température du ciel publiée par un SQMeter en MQTT ; calcule le point de rosée ;
+2. régule un chauffage anti-buée : température du dôme = point de rosée + marge, avec **anticipation** quand le ciel se dégage ;
+3. publie tout sur MQTT (mesures, rapport cyclique PWM, mode et cible du chauffage) et expose une **interface web** (état, réglages, forçage).
 
 ```
 capteurs + chauffage → Raspberry Pi (ce programme) → broker Mosquitto → indi-allsky → latest_metadata.json → site web
@@ -19,8 +21,11 @@ capteurs + chauffage → Raspberry Pi (ce programme) → broker Mosquitto → in
 | `allsky/dome_temperature` | DS18B20 | température dans le dôme (°C) |
 | `allsky/sky_temperature` | MLX90614 ou SQMeter (MQTT) | température du ciel (°C) : MLX90614 si `mlx90614` est dans `ENABLED`, sinon la valeur lue sur `SKY_TEMP_TOPIC` |
 | `allsky/dome_heater_pwm` | chauffage | rapport cyclique appliqué (%), seulement si le chauffage est activé |
+| `allsky/heater_mode` | chauffage | `auto` ou `force` (état, publié toutes les 10 s) |
+| `allsky/heater_target` | chauffage | cible effective (°C) |
+| `allsky/heater_command` | **entrant** | `18`, `18 30` ou `cancel` (QoS 1, jamais retenu) |
 
-`--print-topics` ne liste que les capteurs activés dans `ENABLED` (plus la pression de station si `ALTITUDE_M` est défini, plus `sky_temperature` si `SKY_TEMP_TOPIC` est renseigné, plus `dome_heater_pwm` si le chauffage est activé) : c'est cette liste, et rien d'autre, qu'il faut coller dans indi-allsky.
+`--print-topics` ne liste que les capteurs activés dans `ENABLED` (plus la pression de station si `ALTITUDE_M` est défini, plus `sky_temperature` si `SKY_TEMP_TOPIC` est renseigné, plus `dome_heater_pwm` si le chauffage est activé) : c'est cette liste, et rien d'autre, qu'il faut coller dans indi-allsky. `heater_mode`, `heater_target` et `heater_command` sont un état et une commande, pas des mesures : ils n'y figurent pas.
 
 ## Pression : niveau de la mer ou pression de station
 
@@ -64,20 +69,41 @@ Chaque résistance dissipe 0,53 W à pleine puissance, un peu plus de la moitié
 
 Avec une autre tension, le programme recalcule le plafond (`HEATER_SUPPLY_VOLTS`) : sous 12 V, chaque résistance dissiperait 3,06 W à 100 %, trois fois son nominal, et le rapport cyclique serait plafonné à 16 %. Il **refuse de démarrer le chauffage si la tension n'est pas renseignée**.
 
-## Installation sur la Pi 3 B+
+## Installation
 
-**Avant tout, active l'I2C et le 1-Wire** : `sudo raspi-config`, Interface Options, I2C puis 1-Wire, et redémarre. Sans cela, le BME280 et le DS18B20 restent invisibles.
+**Depuis la release (version figée, recommandé)** : télécharge l'installateur publié et vérifie son
+empreinte avant de l'exécuter.
 
+```bash
+VERSION=1.0.0
+BASE=https://github.com/darkvad/allsky-sensors-pi/releases/download/v$VERSION
+curl -fsSLO "$BASE/install.sh"
+curl -fsSLO "$BASE/SHA256SUMS"
+sha256sum -c SHA256SUMS --ignore-missing    # doit répondre « OK »
+sudo bash install.sh
 ```
-sudo apt install i2c-tools python3-venv
-sudo mkdir -p /opt/allsky-sensors && sudo chown $USER /opt/allsky-sensors
-cp allsky_sensors_mqtt.py requirements.txt /opt/allsky-sensors/
-python3 -m venv /opt/allsky-sensors/venv
-/opt/allsky-sensors/venv/bin/pip install -r /opt/allsky-sensors/requirements.txt
-sudo usermod -aG i2c,gpio $USER      # puis se reconnecter
+
+L'installateur télécharge l'archive de la release, **vérifie son SHA256**, l'extrait dans un dossier
+temporaire et installe cette version. `--release X.Y.Z` installe une autre release.
+
+**Depuis le dépôt** (développement, mises à jour par `git pull`) :
+
+```bash
+git clone https://github.com/darkvad/allsky-sensors-pi.git
+cd allsky-sensors-pi
+sudo ./install.sh
 ```
 
-gpiozero peut afficher un avertissement de repli de bibliothèque GPIO : sans importance.
+Le script installe les paquets manquants, crée `/opt/allsky-sensors` et son venv, pose les questions
+(broker, capteurs, chauffage, interface web), **valide la configuration avec le programme**, écrit
+`/etc/allsky-sensors/allsky-sensors.env` en 600, installe les deux unités systemd et propose d'activer
+I2C / 1-Wire. Un redémarrage peut être nécessaire.
+
+Questions, options (`--upgrade`, `--uninstall`, `--release`, `--dry-run`, `--non-interactive`…),
+sauvegarde, dépannage et arborescence installée : **[INSTALLATION.md](INSTALLATION.md)**.
+
+Câble d'abord les capteurs ([CABLAGE.md](CABLAGE.md)) ; `gpiozero` peut afficher un avertissement de
+repli de bibliothèque GPIO : sans importance.
 
 ## Essais, dans l'ordre
 
@@ -130,6 +156,47 @@ Les gains par défaut sont stables sur un modèle de dôme (deux inerties, retar
 
 **Anticipation par ciel dégagé** (facultatif) : un ciel clair fait rayonner le dôme, qui descend sous la température de l'air. Quand `ciel − air` passe sous `SKY_CLEAR_DELTA_C` (défaut −10 °C), la cible automatique est relevée de `SKY_ANTICIPATION_C` (défaut 0 = désactivé), avec une hystérésis de retour `SKY_CLEAR_HYSTERESIS_C` (2 °C) pour éviter de battre quand un nuage passe. La mesure du ciel peut venir du MLX90614 local ou de `SKY_TEMP_TOPIC` (SQMeter) ; sans mesure fraîche du ciel ou de l'air, la marge nominale revient. Le forçage ignore l'anticipation, et les sécurités (plafond de puissance, coupure en surchauffe, dôme périmé) restent inchangées. La page `/` affiche `ciel − air` et l'anticipation appliquée.
 
+## Interface web
+
+Deux services systemd : `allsky-sensors` (capteurs, chauffage, GPIO) et `allsky-sensors-web` (HTTP).
+L'interface ne dépend pas de la boucle de sécurité : si elle tombe, le chauffage continue.
+
+| Page | Contenu |
+|---|---|
+| `/` | état : mode, cible, dôme, rosée, `ciel − air`, anticipation, PWM, mesures, erreurs de configuration |
+| `/chauffage` | forçage : consigne (°C) et durée (5 min à 24 h), ou retour en automatique |
+| `/reglages` | formulaire généré depuis le schéma : toutes les variables, section par section |
+| `/sante` | JSON pour la supervision (200 si l'état a moins de 300 s, 503 sinon) |
+
+Authentification **Basic** obligatoire (`WEB_USER`, `WEB_PASSWORD` de 12 caractères au moins, généré par
+`install.sh` si tu le laisses vide). Le formulaire est protégé par un jeton anti-CSRF, et les secrets ne
+sont jamais renvoyés au navigateur. Pas de HTTPS : réseau local uniquement, tunnel SSH depuis l'extérieur.
+Le service web tourne avec le compte du service, dans un bac à sable systemd (`ProtectSystem=strict`,
+`ReadWritePaths` limités à l'état et au dossier de configuration).
+
+## Forcer le chauffage
+
+Depuis la page `/chauffage`, ou par MQTT sur le service en marche :
+
+```bash
+mosquitto_pub -h BROKER -u allsky-pi -P '…' -t allsky/heater_command -m '18'      # 18 °C, 60 min
+mosquitto_pub -h BROKER -u allsky-pi -P '…' -t allsky/heater_command -m '18 30'   # 18 °C, 30 min
+mosquitto_pub -h BROKER -u allsky-pi -P '…' -t allsky/heater_command -m 'cancel'  # retour automatique
+```
+
+ou en ligne de commande (processus éphémère, sans GPIO ni MQTT) :
+
+```bash
+/opt/allsky-sensors/venv/bin/python /opt/allsky-sensors/allsky_sensors_mqtt.py --heater-force 18
+/opt/allsky-sensors/venv/bin/python /opt/allsky-sensors/allsky_sensors_mqtt.py --heater-cancel
+```
+
+La consigne est bornée par `HEATER_MAX_DOME_TEMP` et expire (24 h au maximum) ; un redémarrage du
+service l'annule. Une consigne forcée ne dispense **que** de la mesure du point de rosée : le plafond de
+puissance, la coupure en surchauffe et la coupure sur dôme périmé restent actifs. L'anticipation ne
+s'applique pas en mode forcé.
+
+
 ## Le broker (sur le Linux d'indi-allsky)
 
 Le dépôt d'indi-allsky contient un script de déploiement de Mosquitto (`./misc/setup_mosquitto.sh`). Sinon : `sudo apt install mosquitto mosquitto-clients`.
@@ -149,22 +216,16 @@ sudo systemctl restart mosquitto
 
 Réseau local uniquement : n'expose jamais ce port à Internet. Pour voir les mesures : `mosquitto_sub -h localhost -u allsky-pi -P MOT_DE_PASSE -t 'allsky/#' -v`
 
-## Lancement automatique sur la Pi
+## Mise à jour et désinstallation
 
-```
-sudo install -d -m 750 -o $USER -g $USER /etc/allsky-sensors      # dossier inscriptible par le service web
-sudo install -m 600 -o $USER -g $USER allsky-sensors.env.example /etc/allsky-sensors/allsky-sensors.env
-sudoedit /etc/allsky-sensors/allsky-sensors.env                   # broker, identifiants, chauffage, mot de passe web
-
-# unités : le compte du service est substitué automatiquement, rien à éditer à la main
-sudo install -m 644 allsky-sensors.service allsky-sensors-web.service /etc/systemd/system/
-sudo sed -i "s/^User=.*/User=$(id -un)/" /etc/systemd/system/allsky-sensors.service /etc/systemd/system/allsky-sensors-web.service
-sudo systemctl daemon-reload && sudo systemctl enable --now allsky-sensors allsky-sensors-web
+```bash
+git pull && sudo ./install.sh --upgrade     # remplace le programme, garde le .env, redémarre les services
+sudo ./install.sh --uninstall               # arrête et retire les services, sauvegarde le .env
 ```
 
-Si tu préfères éditer l'unité sur place (`/etc/systemd/system/allsky-sensors-web.service`), garde-la
-identique à celle du dépôt : seul `User=` doit différer. Les directives attendues sont rappelées dans
-`PLAN.md` (« Décision du 23/11 »), et un refus d'écriture de `/reglages` nomme désormais celle qui manque.
+Le `.env` n'est jamais modifié par `--upgrade` : pour changer un réglage, passe par `/reglages` ou
+édite `/etc/allsky-sensors/allsky-sensors.env` (relu au tick suivant). Si l'unité web est éditée sur la
+Pi, garde-la identique à celle du dépôt, seul `User=` devant différer.
 
 ## Réglage d'indi-allsky
 
@@ -210,8 +271,16 @@ Repères pour vérifier le montage :
 - une valeur hors de -80 à +150 °C est traitée comme une erreur de lecture et n'est pas publiée : le topic garde sa dernière valeur, puis n'est plus mis à jour au bout de 10 minutes ;
 - le programme ne touche pas au facteur d'émission du capteur (réglé dans son EEPROM) et ne publie pas sa mesure « ambiante » interne, qui ne vaut pas un vrai thermomètre d'air.
 
-Cette mesure ne commande encore rien : la régulation du chauffage continue de comparer la température du dôme au point de rosée de l'air. Elle sert pour l'instant à l'affichage, et à repérer un ciel clair ou couvert.
+Cette mesure sert à l'affichage et à l'**anticipation** : quand `ciel − air` passe sous `SKY_CLEAR_DELTA_C`, la cible automatique est relevée de `SKY_ANTICIPATION_C` (désactivé par défaut), avec hystérésis. Voir « Anticipation par ciel dégagé » ci-dessus.
+
+Si le MLX90614 n'est pas sur la Pi, un SQMeter peut publier la mesure sur le broker : `SKY_TEMP_TOPIC=sqmeter/state`, `SKY_TEMP_KEY=infrared.skyTemperature` (message JSON, contrôles `dataStale` et `infrared.status`). Le MLX local reste prioritaire s'il est activé.
 
 ## Développement
 
-`pip install pytest ruff` puis `pytest` et `ruff check .` : 57 tests (point de rosée, DS18B20, MLX90614, plafond de puissance, sécurités, régulation en boucle fermée, sortie PWM simulée, chien de garde). Deux sont ignorés si gpiozero n'est pas installé, et celui du chien de garde systemd a besoin d'un socket Unix : il ne passe que sur Linux.
+```bash
+pip install pytest ruff
+pytest
+ruff check .
+```
+
+263 tests : point de rosée, DS18B20, MLX90614, plafond de puissance, sécurités, régulation en boucle fermée, sortie PWM simulée, chien de garde, forçage (fichier, MQTT, web), configuration et validation, rechargement à chaud, `status.json`, interface web (serveur réel sur le port 0), source du ciel par MQTT, anticipation, et script d'installation (`tests/test_install_script.py` vérifie la syntaxe bash et le `.env` généré). Deux tests sont ignorés si `gpiozero` n'est pas installé, et celui du chien de garde systemd a besoin d'un socket Unix : il ne passe que sur Linux.
