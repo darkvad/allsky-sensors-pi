@@ -223,7 +223,19 @@ def test_heater_test_is_capped_and_always_switched_off(mock_gpio, monkeypatch):
 
 def run_main(monkeypatch, capsys, args, env):
     env = {"ENV_FILE": "", **env}  # par défaut, aucun fichier réel : tests reproductibles partout
-    prefixes = ("HEATER_", "MQTT_", "ALTITUDE_", "MLX90614_", "DS18B20_", "BME280_", "ENABLED", "STATE_DIR", "ENV_FILE", "WEB_")
+    prefixes = (
+        "HEATER_",
+        "MQTT_",
+        "ALTITUDE_",
+        "MLX90614_",
+        "DS18B20_",
+        "BME280_",
+        "ENABLED",
+        "STATE_DIR",
+        "ENV_FILE",
+        "WEB_",
+        "SKY_",
+    )
     for key in [k for k in os.environ if k.startswith(prefixes)]:
         monkeypatch.delenv(key)
     for key, value in env.items():
@@ -768,14 +780,16 @@ def test_mqtt_message_text_reaches_the_handler():
     received = []
     publisher = sensors.Publisher("localhost", 1883, "", "", dry_run=True)
     publisher._on_command = received.append
-    publisher._on_message(None, None, SimpleNamespace(payload=b"18 30"))
-    publisher._on_message(None, None, SimpleNamespace(payload=b"annuler"))
+    topic = publisher._command_topic
+    publisher._on_message(None, None, SimpleNamespace(topic=topic, payload=b"18 30"))
+    publisher._on_message(None, None, SimpleNamespace(topic=topic, payload=b"annuler"))
     assert received == ["18 30", "annuler"]
 
 
 def test_mqtt_messages_are_ignored_when_no_command_is_expected():
     publisher = sensors.Publisher("localhost", 1883, "", "", dry_run=True)  # aucune souscription prévue
-    publisher._on_message(None, None, SimpleNamespace(payload=b"18"))  # sans effet et sans erreur
+    message = SimpleNamespace(topic=f"{sensors.PREFIX}/{sensors.HEATER_COMMAND_TOPIC}", payload=b"18")
+    publisher._on_message(None, None, message)  # sans effet et sans erreur
 
 
 def test_mqtt_command_error_never_escapes_the_callback():
@@ -784,7 +798,8 @@ def test_mqtt_command_error_never_escapes_the_callback():
 
     publisher = sensors.Publisher("localhost", 1883, "", "", dry_run=True)
     publisher._on_command = boom
-    publisher._on_message(None, None, SimpleNamespace(payload=b"18"))  # avalé et journalisé
+    message = SimpleNamespace(topic=publisher._command_topic, payload=b"18")
+    publisher._on_message(None, None, message)  # avalé et journalisé
 
 
 def test_subscription_result_is_logged(caplog):
@@ -805,7 +820,165 @@ def test_service_announces_a_disabled_heater(tmp_path, monkeypatch, capsys, capl
     assert "chauffage désactivé" in caplog.text  # la raison de l'absence de commande est dite
 
 
+# ----------------------------------------------------------------------------- température du ciel par MQTT
+
+
+SQMETER_STATE = {
+    "timestamp": 1795452598,
+    "timeValid": True,
+    "dataAgeMs": 3053,
+    "dataStale": False,
+    "light": {"status": "missing"},
+    "sky": {"status": "missing", "source": "sqm"},
+    "environment": {"status": "missing"},
+    "infrared": {"status": "ok", "ageMs": 3050, "skyTemperature": 23.9, "ambientTemperature": 26.4},
+    "clouds": {
+        "status": "ok",
+        "coverPercent": 100,
+        "condition": "overcast",
+        "description": "Overcast",
+        "temperatureDelta": -2.5,
+        "correctedDelta": -2.9,
+        "humidity": 53,
+        "humiditySource": "assumed",
+    },
+}
+
+
+def sqmeter_config(**overrides):
+    return sensors.SkyConfig(topic="sqmeter/state", **overrides)
+
+
+def sqmeter_payload(**overrides):
+    data = json.loads(json.dumps(SQMETER_STATE))
+    data.update(overrides)
+    return json.dumps(data).encode()
+
+
+def test_mqtt_sky_temperature_is_read_from_the_sqmeter_json():
+    assert sensors.read_sky_payload(sqmeter_payload(), sqmeter_config()) == (pytest.approx(23.9), None)
+
+
+def test_mqtt_sky_temperature_follows_the_configured_path():
+    ambient, problem = sensors.read_sky_payload(sqmeter_payload(), sqmeter_config(key="infrared.ambientTemperature"))
+    assert problem is None and ambient == pytest.approx(26.4)
+
+
+def test_a_plain_number_topic_needs_an_empty_key():
+    config = sensors.SkyConfig(topic="sqmeter/sky", key="", stale_key="", status_key="")
+    assert sensors.read_sky_payload(b"-12.5", config) == (-12.5, None)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "motif"),
+    [
+        ({"dataStale": True}, "périmée"),
+        ({"infrared": {"status": "missing"}}, "ok"),
+        ({"infrared": {"status": "ok"}}, "absente"),  # ni skyTemperature ni ambientTemperature
+        ({"infrared": {"status": "ok", "skyTemperature": "chaud"}}, "n'est pas un nombre"),
+        ({"infrared": {"status": "ok", "skyTemperature": True}}, "n'est pas un nombre"),
+        ({"infrared": {"status": "ok", "skyTemperature": 400}}, "hors bornes"),
+        ({"infrared": {"status": "ok", "skyTemperature": -100}}, "hors bornes"),
+    ],
+)
+def test_unusable_mqtt_sky_messages_are_rejected(overrides, motif):
+    value, problem = sensors.read_sky_payload(sqmeter_payload(**overrides), sqmeter_config())
+    assert value is None and problem is not None and motif in problem
+
+
+def test_mqtt_sky_payload_must_be_json_and_bounded():
+    value, problem = sensors.read_sky_payload(b"pas du JSON", sqmeter_config())
+    assert value is None and "JSON" in problem
+    oversized = b"{" + b" " * sensors.SKY_MAX_PAYLOAD_BYTES + b"}"
+    value, problem = sensors.read_sky_payload(oversized, sqmeter_config())
+    assert value is None and "volumineux" in problem
+
+
+def test_mqtt_sky_config_defaults_and_topic_validation():
+    default = sensors.SkyConfig.from_env({})
+    assert not default.enabled
+    assert default.key == "infrared.skyTemperature"
+    assert default.stale_key == "dataStale" and default.status_key == "infrared.status"
+    assert default.max_age == 600
+    config = sensors.SkyConfig.from_env({"SKY_TEMP_TOPIC": "sqmeter/state", "SKY_MAX_AGE": "120"})
+    assert config.enabled and config.max_age == 120
+    # Un espace de bord est neutralisé (le piège du 22/11 ne peut plus se produire) ; ailleurs, il est refusé.
+    assert sensors.SkyConfig.from_env({"SKY_TEMP_TOPIC": " sqmeter/state  "}).topic == "sqmeter/state"
+    for bad in ("sq meter/state", "sqmeter/#", "sqmeter/+/state"):
+        with pytest.raises(ValueError, match="topic littéral"):
+            sensors.SkyConfig.from_env({"SKY_TEMP_TOPIC": bad})
+
+
+def test_mqtt_sky_feed_keeps_the_last_value_until_it_expires():
+    feed = sensors.SkyFeed(sqmeter_config())
+    assert feed.handle(sqmeter_payload()) == pytest.approx(23.9)
+    reading = feed.reading(time.monotonic(), 600)
+    assert reading is not None and reading[0] == pytest.approx(23.9)
+    assert feed.reading(reading[1] + 601, 600) is None  # source muette : la valeur est oubliée
+
+
+def test_mqtt_sky_feed_recovers_after_an_invalid_message(caplog):
+    feed = sensors.SkyFeed(sqmeter_config())
+    with caplog.at_level("WARNING", logger="allsky-sensors"):
+        assert feed.handle(b"{}") is None
+    assert "ignorée" in caplog.text
+    assert feed.handle(sqmeter_payload()) == pytest.approx(23.9)
+
+
+def test_mqtt_sky_is_used_only_without_a_local_sensor():
+    feed = sensors.SkyFeed(sqmeter_config())
+    feed.handle(sqmeter_payload())
+    now = time.monotonic()
+    measurement = sensors.sky_measurement(feed, sqmeter_config(), {}, now)
+    assert measurement is not None and measurement[0] == pytest.approx(23.9)
+    assert sensors.sky_measurement(feed, sqmeter_config(), {"sky_temperature": -5.0}, now) is None
+    assert sensors.sky_measurement(feed, sensors.SkyConfig(), {}, now) is None  # source désactivée
+
+
+def test_mqtt_sky_message_reaches_the_feed():
+    feed = sensors.SkyFeed(sqmeter_config())
+    publisher = sensors.Publisher(
+        "localhost", 1883, "", "", dry_run=True, sky_topic="sqmeter/state", on_sky=feed.handle
+    )
+    message = SimpleNamespace(topic="sqmeter/state", payload=sqmeter_payload())
+    publisher._on_message(None, None, message)
+    assert feed.reading(time.monotonic(), 600)[0] == pytest.approx(23.9)
+
+
+def test_mqtt_messages_from_other_topics_are_ignored():
+    received = []
+    feed = sensors.SkyFeed(sqmeter_config())
+    publisher = sensors.Publisher(
+        "localhost", 1883, "", "", dry_run=True, on_command=received.append,
+        sky_topic="sqmeter/state", on_sky=feed.handle,
+    )
+    message = SimpleNamespace(topic="ailleurs/state", payload=sqmeter_payload())
+    publisher._on_message(None, None, message)
+    assert received == [] and feed.reading(time.monotonic(), 600) is None
+
+
+def test_topic_list_includes_the_sky_from_mqtt(monkeypatch, capsys):
+    _, out = run_main(monkeypatch, capsys, ["--print-topics"], {"SKY_TEMP_TOPIC": "sqmeter/state"})
+    names = [topic.split("/")[1] for topic in out.strip().split(",")]
+    assert names.count("sky_temperature") == 1 and names[-1] == "sky_temperature"
+    env = {"ENABLED": "bme280,ds18b20,mlx90614", "SKY_TEMP_TOPIC": "sqmeter/state"}
+    _, out = run_main(monkeypatch, capsys, ["--print-topics"], env)
+    assert out.count("sky_temperature") == 1  # une seule source, même si les deux sont configurées
+
+
+def test_a_sky_topic_with_a_wildcard_is_refused_at_startup(monkeypatch, capsys):
+    code, _ = run_main(monkeypatch, capsys, ["--simulate", "--dry-run", "--once"], {"SKY_TEMP_TOPIC": "sqmeter/#"})
+    assert code == 2
+
+
+def test_settings_read_the_sky_source():
+    settings = sensors.Settings.from_env({"SKY_TEMP_TOPIC": "sqmeter/state", "SKY_MAX_AGE": "120"})
+    assert settings.sky.topic == "sqmeter/state" and settings.sky.max_age == 120
+    assert sensors.Settings.from_env({}).sky.enabled is False
+
+
 # ----------------------------------------------------------------------------- schéma, validation, réglages
+
 
 EXAMPLE_ENV = Path(__file__).resolve().parent.parent / "allsky-sensors.env.example"
 

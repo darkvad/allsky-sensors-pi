@@ -5,6 +5,7 @@ Capteurs :
   - BME280 (I2C)     : température, humidité et pression extérieures ; point de rosée calculé
   - DS18B20 (1-Wire) : température dans le dôme
   - MLX90614 (I2C)   : température du ciel, lue par un thermomètre infrarouge sans contact
+    (ou lue par MQTT sur un SQMeter : SKY_TEMP_TOPIC, quand le capteur n'est pas sur la Pi)
 Chauffage anti-buée (facultatif, HEATER_ENABLED=1) :
   - commande PWM d'un module MOSFET alimentant des résistances ; régulation de la température du dôme
     à (point de rosée + marge) ; le rapport cyclique appliqué est publié (dome_heater_pwm, en %).
@@ -52,6 +53,14 @@ HEATER_TOPIC = "dome_heater_pwm"
 HEATER_MODE_TOPIC = "heater_mode"  # « auto » ou « force »
 HEATER_TARGET_TOPIC = "heater_target"  # cible effective en °C (jamais listée dans --print-topics)
 HEATER_COMMAND_TOPIC = "heater_command"  # « 18 », « 18 30 » ou « cancel » : consigne pour le service en marche
+# Température du ciel lue sur le broker (SQMeter…) : message JSON, chemin de la valeur, fraîcheur admise.
+SKY_KEY_DEFAULT = "infrared.skyTemperature"
+SKY_STALE_KEY_DEFAULT = "dataStale"  # booléen vrai = donnée périmée : le message est ignoré
+SKY_STATUS_KEY_DEFAULT = "infrared.status"  # doit valoir « ok » pour être retenu
+SKY_MAX_AGE_DEFAULT = 600.0  # secondes : au-delà, la dernière valeur reçue n'est plus utilisée
+SKY_MIN_C, SKY_MAX_C = -80.0, 150.0  # même plage de vraisemblance que le MLX90614
+SKY_MAX_PAYLOAD_BYTES = 64 * 1024  # un message d'état tient très largement en deçà
+SKY_ERROR_REPEAT_SECONDS = 600  # un message ignoré ne remplit pas le journal
 W1_DEVICES = Path("/sys/bus/w1/devices")
 
 # État du programme (consigne de forçage, état publié pour l'interface web) : sous-dossier du programme,
@@ -434,6 +443,53 @@ ENV_SCHEMA: tuple[Param, ...] = (
         allow_empty=True,
     ),
     Param("INTERVAL", "Capteurs", "Période de publication", "int", default="60", minimum=10, maximum=3600, unit="s"),
+    Param(
+        "SKY_TEMP_TOPIC",
+        "Température du ciel (MQTT)",
+        "Topic du SQMeter",
+        "text",
+        default="",
+        allow_empty=True,
+        help="message JSON publié sur le broker, ex. sqmeter/state ; vide : pas de source externe",
+    ),
+    Param(
+        "SKY_TEMP_KEY",
+        "Température du ciel (MQTT)",
+        "Chemin de la température",
+        "text",
+        default=SKY_KEY_DEFAULT,
+        allow_empty=True,
+        help="clé du JSON, points pour descendre ; vide : le message entier doit être un nombre",
+    ),
+    Param(
+        "SKY_STALE_KEY",
+        "Température du ciel (MQTT)",
+        "Chemin du drapeau « périmé »",
+        "text",
+        default=SKY_STALE_KEY_DEFAULT,
+        allow_empty=True,
+        help="booléen vrai = donnée périmée, message ignoré ; vide : pas de contrôle",
+    ),
+    Param(
+        "SKY_STATUS_KEY",
+        "Température du ciel (MQTT)",
+        "Chemin du statut",
+        "text",
+        default=SKY_STATUS_KEY_DEFAULT,
+        allow_empty=True,
+        help="doit valoir « ok » ; vide : pas de contrôle",
+    ),
+    Param(
+        "SKY_MAX_AGE",
+        "Température du ciel (MQTT)",
+        "Fraîcheur admise",
+        "int",
+        default="600",
+        minimum=10,
+        maximum=86400,
+        unit="s",
+        help="au-delà, la dernière valeur reçue est ignorée",
+    ),
     Param("HEATER_ENABLED", "Chauffage", "Chauffage activé", "flag", default="0", help="1 pour activer"),
     Param(
         "HEATER_SUPPLY_VOLTS",
@@ -526,6 +582,43 @@ ENV_SCHEMA: tuple[Param, ...] = (
 ENV_KEYS = frozenset(param.name for param in ENV_SCHEMA)
 
 
+@dataclass(frozen=True)
+class SkyConfig:
+    """Source externe de la température du ciel : un message JSON publié sur le broker MQTT.
+
+    Les valeurs par défaut décrivent le SQMeter (``sqmeter/state``) ; un topic vide désactive la
+    fonctionnalité. ``stale_key`` et ``status_key`` sont facultatifs (chemin vide = pas de contrôle).
+    """
+
+    topic: str = ""
+    key: str = SKY_KEY_DEFAULT
+    stale_key: str = SKY_STALE_KEY_DEFAULT
+    status_key: str = SKY_STATUS_KEY_DEFAULT
+    max_age: float = SKY_MAX_AGE_DEFAULT
+
+    @property
+    def enabled(self) -> bool:
+        """Vrai si une source MQTT est configurée."""
+        return bool(self.topic)
+
+    @classmethod
+    def from_env(cls, env: Mapping[str, str]) -> SkyConfig:
+        """Source lue dans la configuration ; lève ValueError si le topic est inutilisable."""
+        topic = env.get("SKY_TEMP_TOPIC", "").strip()
+        # Un topic MQTT est une chaîne exacte : un espace final l'a déjà fait échouer une fois (22/11).
+        if any(character in topic for character in " \t\r\n+#"):
+            raise ValueError(
+                f"SKY_TEMP_TOPIC doit être un topic littéral, sans espace, « + » ni « # » (reçu : {topic!r})"
+            )
+        return cls(
+            topic=topic,
+            key=env.get("SKY_TEMP_KEY", SKY_KEY_DEFAULT).strip(),  # vide = le message entier doit être un nombre
+            stale_key=env.get("SKY_STALE_KEY", SKY_STALE_KEY_DEFAULT).strip(),
+            status_key=env.get("SKY_STATUS_KEY", SKY_STATUS_KEY_DEFAULT).strip(),
+            max_age=_as_float(env.get("SKY_MAX_AGE"), SKY_MAX_AGE_DEFAULT),
+        )
+
+
 def configured_env_file(env: Mapping[str, str] | None = None) -> Path | None:
     """Fichier d'environnement à relire, ou None s'il n'y en a pas.
 
@@ -587,6 +680,10 @@ def validate_env(env: Mapping[str, str] | None = None) -> list[str]:
         HeaterConfig.from_env(source)
     except ValueError as error:
         errors.append(f"chauffage : {error}")
+    try:
+        SkyConfig.from_env(source)
+    except ValueError as error:
+        errors.append(f"température du ciel : {error}")
     return errors
 
 
@@ -613,6 +710,7 @@ class Settings:
     heater: HeaterConfig | None
     mqtt: MqttConfig
     state_dir: Path
+    sky: SkyConfig = SkyConfig()  # source MQTT de la température du ciel (topic vide = désactivée)
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
@@ -640,6 +738,7 @@ class Settings:
                 password=source.get("MQTT_PASSWORD", ""),
             ),
             state_dir=Path(source.get("STATE_DIR", "").strip() or str(STATE_DIR_DEFAULT)),
+            sky=SkyConfig.from_env(source),
         )
 
 
@@ -1091,14 +1190,133 @@ def build_sensor(name: str, altitude: float | None = None):
     raise ValueError(f"capteur inconnu : {name}")
 
 
+# --------------------------------------------------------------------------- température du ciel par MQTT
+
+
+def _json_node(data: object, key: str) -> tuple[object | None, str | None]:
+    """Nœud d'un objet JSON au chemin ``a.b.c`` (``key`` vide : le message entier)."""
+    node = data
+    for part in key.split(".") if key else ():
+        if not isinstance(node, Mapping) or part not in node:
+            return None, f"clé {key!r} absente du message"
+        node = node[part]
+    return node, None
+
+
+def read_sky_payload(payload: bytes | str, config: SkyConfig) -> tuple[float | None, str | None]:
+    """Température du ciel tirée d'un message JSON : ``(valeur, motif)``, un seul des deux est None.
+
+    ``config.key`` est un chemin (« infrared.skyTemperature ») ; vide, le message entier doit être un
+    nombre. Le drapeau ``stale_key`` et le statut ``status_key`` sont facultatifs (chemin vide) et
+    écartent une donnée que la source annonce elle-même comme périmée ou absente.
+    """
+    if len(payload) > SKY_MAX_PAYLOAD_BYTES:
+        return None, f"message trop volumineux ({len(payload)} octets)"
+    try:
+        data = json.loads(payload)
+    except ValueError:
+        return None, "JSON illisible"
+    if config.stale_key:
+        stale, missing = _json_node(data, config.stale_key)
+        if missing is None and stale is True:
+            return None, f"{config.stale_key} signale une donnée périmée"
+    if config.status_key:
+        status, missing = _json_node(data, config.status_key)
+        if missing is None and str(status).strip().lower() != "ok":
+            return None, f"{config.status_key} vaut {status!r} (« ok » attendu)"
+    node, missing = _json_node(data, config.key)
+    if missing is not None:
+        return None, missing
+    if isinstance(node, bool) or not isinstance(node, (int, float)):
+        return None, f"{config.key or 'la valeur'} n'est pas un nombre"
+    value = float(node)
+    if not math.isfinite(value) or not SKY_MIN_C <= value <= SKY_MAX_C:
+        return None, f"température hors bornes ({value:g} °C)"
+    return value, None
+
+
+class SkyFeed:
+    """Dernière température du ciel reçue par MQTT : le client écrit, la boucle de mesure lit.
+
+    La valeur est horodatée à la réception (``time.monotonic``, la même horloge que la boucle) : une
+    source qui se tait est donc oubliée après ``SKY_MAX_AGE``, comme un capteur périmé.
+    """
+
+    def __init__(self, config: SkyConfig) -> None:
+        self._lock = threading.Lock()
+        self._config = config
+        self._value: float | None = None
+        self._at = 0.0
+        self._valid = False
+        self._problem: str | None = None
+        self._problem_at = 0.0
+
+    @property
+    def config(self) -> SkyConfig:
+        with self._lock:
+            return self._config
+
+    def configure(self, config: SkyConfig) -> None:
+        """Applique un topic ou un chemin modifié à chaud (la dernière valeur reste utilisable)."""
+        with self._lock:
+            self._config = config
+
+    def handle(self, payload: bytes) -> float | None:
+        """Traite un message reçu (thread du client MQTT) ; renvoie la valeur retenue, ou None."""
+        config = self.config
+        value, problem = read_sky_payload(payload, config)
+        now = time.monotonic()
+        with self._lock:
+            if value is None:
+                if problem != self._problem or now - self._problem_at > SKY_ERROR_REPEAT_SECONDS:
+                    log.warning("température du ciel ignorée sur %s : %s", config.topic, problem)
+                    self._problem, self._problem_at = problem, now
+                self._valid = False
+                return None
+            if not self._valid:
+                log.info("température du ciel reçue sur %s : %.1f °C", config.topic, value)
+            self._value, self._at, self._valid = value, now, True
+            self._problem, self._problem_at = None, 0.0
+            return value
+
+    def reading(self, now: float, max_age: float) -> tuple[float, float] | None:
+        """Valeur et instant de réception, si elle n'a pas dépassé ``max_age`` secondes."""
+        with self._lock:
+            if self._value is None or now - self._at > max_age:
+                return None
+            return self._value, self._at
+
+
+def sky_measurement(
+    feed: SkyFeed, config: SkyConfig, current: Mapping[str, float], now: float
+) -> tuple[float, float] | None:
+    """Mesure du ciel à ajouter : la source MQTT, sauf si un capteur local fournit déjà la valeur."""
+    if "sky_temperature" in current or not config.enabled:
+        return None
+    return feed.reading(now, config.max_age)
+
+
 # --------------------------------------------------------------------------- MQTT
 
 
 class Publisher:
-    def __init__(self, host: str, port: int, user: str, password: str, dry_run: bool, on_command=None) -> None:
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        user: str,
+        password: str,
+        dry_run: bool,
+        on_command=None,
+        sky_topic: str = "",
+        on_sky=None,
+    ) -> None:
         self._client = None
         self._pending: list = []
+        self._command_topic = f"{PREFIX}/{HEATER_COMMAND_TOPIC}"
         self._on_command = on_command  # appelé avec le texte d'une commande reçue sur le topic de commande
+        self._sky_topic = sky_topic  # topic JSON de la température du ciel (vide : pas d'abonnement)
+        self._on_sky = on_sky  # appelé avec la charge utile brute reçue sur ce topic
         if dry_run:
             return
         import paho.mqtt.client as mqtt
@@ -1128,8 +1346,11 @@ class Publisher:
             return
         log.info("connecté au broker MQTT")
         if self._on_command is not None:  # abonnement refait à chaque connexion, y compris après coupure
-            client.subscribe(f"{PREFIX}/{HEATER_COMMAND_TOPIC}", qos=1)
-            log.info("commandes acceptées sur %s/%s : « 18 », « 18 30 » ou « cancel »", PREFIX, HEATER_COMMAND_TOPIC)
+            client.subscribe(self._command_topic, qos=1)
+            log.info("commandes acceptées sur %s : « 18 », « 18 30 » ou « cancel »", self._command_topic)
+        if self._sky_topic:
+            client.subscribe(self._sky_topic, qos=1)
+            log.info("température du ciel lue sur %s (message JSON)", self._sky_topic)
 
     @staticmethod
     def _on_subscribe(client, userdata, mid, reason_codes, *rest) -> None:
@@ -1137,13 +1358,31 @@ class Publisher:
         codes = reason_codes if isinstance(reason_codes, (list, tuple)) else [reason_codes]
         refused = [code for code in codes if getattr(code, "is_failure", False) or getattr(code, "value", code) == 128]
         if refused:
-            log.error("abonnement au topic de commande refusé (%s) : droits MQTT de l'utilisateur à vérifier", refused[0])
+            log.error("abonnement MQTT refusé (%s) : droits de l'utilisateur à vérifier", refused[0])
         else:
-            log.info("abonnement au topic de commande accepté")
+            log.info("abonnement MQTT accepté")
+
+    def listen_sky(self, topic: str) -> None:
+        """Suit un topic du ciel modifié à chaud, sans reconstruire le client MQTT."""
+        previous, self._sky_topic = self._sky_topic, topic
+        if self._client is None:
+            return
+        if previous and previous != topic:
+            self._client.unsubscribe(previous)
+        if topic:
+            self._client.subscribe(topic, qos=1)
+            log.info("température du ciel désormais lue sur %s", topic)
 
     def _on_message(self, client, userdata, message) -> None:
-        """Message reçu sur le topic de commande : texte brut (« 18 », « 18 30 », « cancel »)."""
-        if self._on_command is None:
+        """Message reçu : état du ciel (JSON) ou commande de chauffage (texte), selon le topic."""
+        topic = getattr(message, "topic", None)
+        if self._on_sky is not None and self._sky_topic and topic == self._sky_topic:
+            try:
+                self._on_sky(message.payload)
+            except Exception as error:  # noqa: BLE001 - un message en échec ne doit jamais tuer le client MQTT
+                log.warning("message du ciel %r non traité : %s", self._sky_topic, error)
+            return
+        if self._on_command is None or topic != self._command_topic:
             return
         text = message.payload.decode("utf-8", "replace")
         try:
@@ -1192,6 +1431,8 @@ def topic_names(env: Mapping[str, str] | None = None) -> tuple[str, ...]:
         names += topics
         if sensor == "bme280" and source.get("ALTITUDE_M", "").strip():  # avec l'altitude, la pression de station est publiée en plus
             names.insert(names.index("outdoor_pressure") + 1, "outdoor_pressure_station")
+    if source.get("SKY_TEMP_TOPIC", "").strip() and "sky_temperature" not in names:
+        names.append("sky_temperature")  # source MQTT : le topic est publié même sans MLX90614 local
     if source.get("HEATER_ENABLED", "0").strip() == "1":
         names.append(HEATER_TOPIC)
     return tuple(names)
@@ -1363,6 +1604,14 @@ def main() -> int:
         log.info("DS18B20 : correction de %+g °C appliquée à la température du dôme", settings.ds18b20_offset)
     if settings.mlx90614_offset:
         log.info("MLX90614 : correction de %+g °C appliquée à la température du ciel", settings.mlx90614_offset)
+    if settings.sky.enabled:
+        log.info(
+            "température du ciel lue sur %s (clé %s, fraîcheur %g s)%s",
+            settings.sky.topic,
+            settings.sky.key or "(message entier)",
+            settings.sky.max_age,
+            " ; le MLX90614 local reste prioritaire" if "mlx90614" in settings.enabled else "",
+        )
     if settings.altitude is None:
         log.info("ALTITUDE_M non défini : la pression publiée est la pression de station, non ramenée au niveau de la mer")
 
@@ -1390,6 +1639,8 @@ def main() -> int:
             return
         log.info("commande de chauffage reçue (%r) : %s", text, report)
 
+    sky_feed = SkyFeed(settings.sky)
+
     def make_publisher(current: Runtime) -> Publisher:
         return Publisher(
             current.settings.mqtt.host,
@@ -1398,6 +1649,8 @@ def main() -> int:
             current.settings.mqtt.password,
             args.dry_run,
             on_command=heater_on_command if current.controller else None,
+            sky_topic=current.settings.sky.topic,
+            on_sky=sky_feed.handle,
         )
 
     publisher = make_publisher(runtime)
@@ -1429,15 +1682,19 @@ def main() -> int:
                     config_error = " ; ".join(messages)  # visible dans status.json et donc sur le web
                 else:
                     config_error = None
+                    previous_sky = runtime.settings.sky
                     restart_mqtt = reloaded.mqtt != runtime.settings.mqtt
                     close_runtime(runtime)  # coupe le chauffage et libère le GPIO avant de le redemander
                     runtime = build_runtime(reloaded, simulate=args.simulate, dry_run=args.dry_run)
                     unavailable.clear()
+                    sky_feed.configure(runtime.settings.sky)  # la clé du JSON peut avoir changé
                     if runtime.error is not None:
                         log.error("chauffage indisponible : %s", runtime.error)
                     if restart_mqtt:
                         publisher.close()
                         publisher = make_publisher(runtime)
+                    elif runtime.settings.sky.topic != previous_sky.topic:
+                        publisher.listen_sky(runtime.settings.sky.topic)
                     log.info("configuration rechargée depuis %s", env_file)
 
             current: dict[str, float] = {}
@@ -1459,6 +1716,11 @@ def main() -> int:
                     runtime.sensors[name] = None
             for topic, value in current.items():
                 readings[topic] = (value, now)
+            sky = sky_measurement(sky_feed, runtime.settings.sky, current, now)
+            if sky is not None:
+                readings["sky_temperature"] = sky  # publié comme les capteurs locaux
+            elif "sky_temperature" not in current:
+                readings.pop("sky_temperature", None)  # source périmée : ne pas republier une vieille valeur
 
             override = None
             if runtime.controller and runtime.output:

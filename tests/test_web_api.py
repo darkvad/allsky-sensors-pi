@@ -378,7 +378,7 @@ def test_formulaire_affiche_les_sections_et_masque_les_secrets(serveur):
     env_file = server.app.env_file
     code, headers, body = call(port, path="/reglages")
     assert code == 200 and headers["content-type"] == "text/html; charset=utf-8"
-    for section in ("Broker MQTT", "Capteurs", "Chauffage", "Interface web"):
+    for section in ("Broker MQTT", "Capteurs", "Température du ciel (MQTT)", "Chauffage", "Interface web"):
         assert section in body
     assert 'name="HEATER_MARGIN" value="4"' in body  # valeur du fichier
     assert 'type="password"' in body and "au redémarrage" in body

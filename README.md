@@ -17,10 +17,10 @@ capteurs + chauffage → Raspberry Pi (ce programme) → broker Mosquitto → in
 | `allsky/outdoor_pressure_station` | BME280 | pression mesurée (hPa), publiée seulement si `ALTITUDE_M` est défini |
 | `allsky/outdoor_dew_point` | calculé | point de rosée (°C), formule de Magnus |
 | `allsky/dome_temperature` | DS18B20 | température dans le dôme (°C) |
-| `allsky/sky_temperature` | MLX90614 | température du ciel (°C), si `mlx90614` est dans `ENABLED` |
+| `allsky/sky_temperature` | MLX90614 ou SQMeter (MQTT) | température du ciel (°C) : MLX90614 si `mlx90614` est dans `ENABLED`, sinon la valeur lue sur `SKY_TEMP_TOPIC` |
 | `allsky/dome_heater_pwm` | chauffage | rapport cyclique appliqué (%), seulement si le chauffage est activé |
 
-`--print-topics` ne liste que les capteurs activés dans `ENABLED` (plus la pression de station si `ALTITUDE_M` est défini, plus `dome_heater_pwm` si le chauffage est activé) : c'est cette liste, et rien d'autre, qu'il faut coller dans indi-allsky.
+`--print-topics` ne liste que les capteurs activés dans `ENABLED` (plus la pression de station si `ALTITUDE_M` est défini, plus `sky_temperature` si `SKY_TEMP_TOPIC` est renseigné, plus `dome_heater_pwm` si le chauffage est activé) : c'est cette liste, et rien d'autre, qu'il faut coller dans indi-allsky.
 
 ## Pression : niveau de la mer ou pression de station
 

@@ -87,6 +87,9 @@ défaut `/etc/allsky-sensors/allsky-sensors.env`) est lu par la commande, donc e
 | `ENV_FILE` | (vide : pas de rechargement) | 3 | fichier `.env` surveillé ; lu par `--heater-force` |
 | `WEB_BIND` / `WEB_PORT` | `0.0.0.0` / `8080` | 4 | écoute du serveur web |
 | `WEB_USER` / `WEB_PASSWORD` | `admin` / (obligatoire, ≥ 12 caractères) | 4 | authentification |
+| `SKY_TEMP_TOPIC` / `SKY_TEMP_KEY` | (vide) / `infrared.skyTemperature` | après 6 ✅ | topic JSON du SQMeter et chemin de la température |
+| `SKY_STALE_KEY` / `SKY_STATUS_KEY` | `dataStale` / `infrared.status` | après 6 ✅ | garde-fous annoncés par la source (vide : pas de contrôle) |
+| `SKY_MAX_AGE` | `600` | après 6 ✅ | fraîcheur admise d'une valeur externe |
 
 ## 4. Avancement
 
@@ -99,6 +102,7 @@ défaut `/etc/allsky-sensors/allsky-sensors.env`) est lu par la commande, donc e
 | 4 | Web : socle (serveur, authentification, page d'état) | ✅ **terminé** | `web_api.py` + unité durcie ; 26 tests dans `tests/test_web_api.py` (serveur réel sur le port 0), 183 verts au total |
 | 5 | Web : formulaire de réglages | ✅ **terminé** | formulaire depuis `ENV_SCHEMA`, `POST /reglages` (303) + jeton anti-CSRF, 46 tests web, 203 verts au total |
 | 6 | Web : commandes de forçage | ✅ **terminé** | `/chauffage`, `POST /forcer` et `POST /forcer/annuler` ; 70 tests dans `tests/test_web_api.py`, 227 verts au total ; chaîne vérifiée en direct le 23/11 (`override.json` → `heater_mode force`, `status.json` `mode force` cible 18,0, puis `auto` après annulation) |
+| 6b | Cœur : température du ciel par MQTT (SQMeter) | ✅ **terminé** | `SKY_*`, `SkyConfig`, `read_sky_payload`, `SkyFeed` ; 20 tests ajoutés (247 verts au total) ; message du SQMeter → `allsky/sky_temperature 23.9` et `status.json` vérifiés |
 | 7 | Déploiement, doc, README | ⏳ à faire | |
 
 ## 5. Détail des étapes
@@ -899,7 +903,7 @@ Contrainte matérielle (23/11) : les résistances de **2 W ne tiennent pas sous 
 Piste réaliste : **8 × 1 W** → 4,0 W au plafond, 0,80 A, même fusible de 1 A (marge juste) ; les deux
 unités supplémentaires se dispersent mieux autour du dôme que des 2 W serrées. Au-delà de 8, le courant
 dépasse le fusible (10 → 1,0 A) : à remplacer avant d'y penser. En attendant, le levier gratuit reste
-l'anticipation (voir « Température du ciel par MQTT »).
+l'anticipation (voir « Température du ciel : MQTT ou Alpaca »).
 
 ### Prochaine étape
 
@@ -916,32 +920,81 @@ l'anticipation (voir « Température du ciel par MQTT »).
 
 Pour reprendre : lire les sections 4 (avancement) et 5 (détail des étapes), puis cette section 9.
 
-### Température du ciel par MQTT (idée retenue, après l'étape 6)
+### Température du ciel par MQTT (livrée le 23/11)
 
-Le MLX90614 **n'est pas câblé sur la Pi** : il sert à un projet SQMeter, ailleurs. Plutôt que d'en acheter
-un second, le service peut lire sa mesure sur le broker — c'est le même Mosquitto (192.168.155.248), et
-l'abonnement existe déjà pour `heater_command`.
+> Piste **Alpaca non utilisée** : MQTT a été activé dans le SQMeter (topic `sqmeter/state`), donc le
+> service lit sa mesure sur le broker, comme les autres. Rien n'est codé pour Alpaca.
 
-Contrat proposé (rien n'est codé à ce jour) :
+Le MLX90614 **n'est pas câblé sur la Pi** : il sert à un projet SQMeter, ailleurs, qui publie son état
+sur le même broker Mosquitto. Le service s'y abonne (aucune dépendance nouvelle : le client paho est
+déjà là) et la valeur alimente `sky_temperature` quand aucun MLX90614 local ne la fournit.
+
+Contrat livré (dans `allsky_sensors_mqtt.py`) :
 
 | Variable | Défaut | Rôle |
 |---|---|---|
-| `SKY_TEMP_TOPIC` | (vide : désactivé) | topic d'où lire la température du ciel (ex. `sqmeter/sky_temperature`), QoS 1 |
-| `SKY_TEMP_MAX_AGE` | `600` | au-delà de cet âge (s), la valeur reçue est ignorée |
+| `SKY_TEMP_TOPIC` | (vide : désactivé) | topic du message JSON, ex. `sqmeter/state` ; QoS 1 |
+| `SKY_TEMP_KEY` | `infrared.skyTemperature` | chemin dans le JSON (points) ; vide : message entier = nombre |
+| `SKY_STALE_KEY` | `dataStale` | booléen vrai = donnée périmée, message ignoré ; vide : pas de contrôle |
+| `SKY_STATUS_KEY` | `infrared.status` | doit valoir `ok` ; vide : pas de contrôle |
+| `SKY_MAX_AGE` | `600` | au-delà de cet âge (s) sans message, la valeur n'est plus utilisée |
 
-- abonnement refait à **chaque** connexion (comme `heater_command`), valeur bornée (−80 à +150 °C), horodatée ;
-- usage 1 (simple) : publier `sky_temperature` quand `mlx90614` n'est pas dans `ENABLED` — un topic de
-  mesure de plus, sans matériel ;
-- usage 2 (le vrai gain) : **anticipation**. Quand `ciel − air` décroche (ciel clair = le dôme rayonne),
-  relever la marge ou avancer le chauffage, au lieu d'attendre que le dôme atteigne la cible. À 3 W,
-  anticiper vaut mieux que chauffer plus fort ;
-- garde-fous : une valeur externe ne doit **jamais** contourner `max_duty`, la coupure à
-  `HEATER_MAX_DOME_TEMP`, ni la coupure sur mesure périmée ; topic vide = fonctionnalité absente, zéro
-  surprise ; si le topic est retenu (retain), la valeur est disponible dès la connexion.
+Le message du SQMeter (extrait utile) :
 
-À vérifier avant de coder : ce que le SQMeter publie réellement. S'il publie une **magnitude**
-(mag/arcsec²) et pas une température, on peut quand même s'en servir comme indicateur « ciel clair » —
-c'est même plus direct — avec un seuil plutôt qu'un écart de températures.
+```json
+{"dataStale": false, "infrared": {"status": "ok", "skyTemperature": 23.9,
+ "ambientTemperature": 26.4}}
+```
+
+
+#### Mise en œuvre (livrée)
+
+- `SkyConfig` (schéma, validation, `Settings`) : topic, chemins, fraîcheur ; `SKY_TEMP_TOPIC` vide =
+  fonctionnalité absente ; topic normalisé (espaces de bord retirés) et sans wildcard (refusé au
+  démarrage : un espace interne, `+` ou `#` n'a rien à faire là) ;
+- `read_sky_payload()` extrait la valeur du JSON au chemin demandé, contrôle `dataStale`/`status`,
+  borne la valeur (−80 à +150 °C) et la taille du message (64 Kio) ; `SkyFeed` garde la dernière
+  valeur avec son horodatage, sous verrou (thread du client MQTT ↔ boucle de mesure) ;
+- `Publisher` s'abonne à `SKY_TEMP_TOPIC` à chaque connexion, route les messages **par topic** et
+  `listen_sky()` suit un topic modifié à chaud sans reconstruire le client ;
+- la boucle ajoute `sky_temperature` aux mesures quand aucun capteur local ne la fournit ; une source
+  périmée est retirée (pas de valeur figée) ; `status.json` et MQTT la publient comme les autres ;
+- **priorité au capteur local** : si `mlx90614` est dans `ENABLED` et lit, la valeur MQTT n'est pas
+  utilisée (aucun doublon de topic) ;
+- `--print-topics` liste `sky_temperature` dès que `SKY_TEMP_TOPIC` est renseigné ;
+- aucune sécurité n'est touchée : une valeur externe ne contourne ni `max_duty`, ni la coupure à
+  `HEATER_MAX_DOME_TEMP`, ni la coupure sur mesure périmée.
+
+Diagnostic si rien n'arrive (topic exact, ACL, broker) :
+
+```bash
+timeout 60 mosquitto_sub -h 192.168.155.248 -u allsky-pi -P 'MOT_DE_PASSE' -t 'sqmeter/#' -v
+```
+
+#### Tests (sans matériel)
+
+```powershell
+python -m pytest -q -k "sky"      # parseur, bornes, fraîcheur, priorité au capteur local, routage MQTT
+python -m pytest -q               # suite complète
+```
+
+- le JSON fourni par le SQMeter (état `overcast`) donne `23,9 °C` ; `dataStale` vrai ou
+  `infrared.status = missing` sont refusés avec un motif ; `SKY_TEMP_KEY=infrared.ambientTemperature`
+  donne `26,4 °C` ;
+- vérifié en direct le 23/11 (service sans broker, message injecté) : `allsky/sky_temperature = 23.9`
+  publié et `status.json` `readings.sky_temperature = 23.9` ;
+- sur la Pi : renseigner `SKY_TEMP_TOPIC=sqmeter/state`, puis `journalctl -u allsky-sensors -f`
+  (ligne « température du ciel reçue sur sqmeter/state ») et
+  `mosquitto_sub -t 'allsky/sky_temperature' -v`.
+
+#### Anticipation (suite, non livrée)
+
+Une fois la mesure fiable, l'usage qui apporte vraiment quelque chose à 3-4 W : quand le ciel se
+dégage (`ciel − air` qui décroche, ou magnitude élevée), **relever la marge** ou avancer le chauffage
+au lieu d'attendre que le dôme atteigne la cible. À faire avec des mesures réelles, un seuil et une
+hystérésis à régler sur le dôme — et sans jamais contourner les sécurités ci-dessus.
+
+
 
 ### Clôture de la session du 23/11
 
@@ -961,10 +1014,11 @@ formulaire `/reglages` qui écrit `/etc/allsky-sensors/allsky-sensors.env` (jeto
   permission d'écriture va dans l'unité de la Pi (le message de `/reglages` la nomme) ;
 - `Referrer-Policy: same-origin` et jeton `_jeton` : les deux sont liés (voir incidents du 22/11).
 
-**État du dépôt** : les étapes 1 à 5 sont **commitées localement** (`2f7e155`, « Forçage du chauffage,
-rechargement à chaud et interface web ») ; aucun push n'a été fait (règle `agents.md`). L'étape 6 est
-livrée dans l'arbre de travail (`web_api.py`, `tests/test_web_api.py`, ce document), pas encore commitée.
-`pytest` : 227 passés, 2 ignorés (gpiozero absent sous Windows), 1 échec `AF_UNIX` pré-existant sous
+**État du dépôt** : les étapes 1 à 6 sont **commitées et poussées** (`dfae436`, « Interface web :
+forçage du chauffage (étape 6) »). La température du ciel par MQTT est livrée dans l'arbre de travail
+(`allsky_sensors_mqtt.py`, `tests/test_allsky_sensors.py`, `allsky-sensors.env.example`, `README.md`,
+ce document), pas encore commitée.
+`pytest` : 247 passés, 2 ignorés (gpiozero absent sous Windows), 1 échec `AF_UNIX` pré-existant sous
 Windows ; `ruff` : OK.
 
 ### Étape 6 livrée (23/11)
@@ -982,9 +1036,26 @@ Windows ; `ruff` : OK.
   étrangère, 40 °C refusé, durées 2 et 1500 min refusées, virgule décimale, chauffage désactivé,
   configuration sans tension, écriture `EROFS`, échappement du message de redirection.
 
+### Température du ciel par MQTT livrée (23/11)
+
+Le SQMeter publie désormais son état sur le broker, topic `sqmeter/state` (même serveur, même compte
+que le service) ; le MLX90614 du SQMeter est la seule source utile (`infrared.skyTemperature`) :
+
+- `SKY_TEMP_TOPIC=sqmeter/state`, `SKY_TEMP_KEY=infrared.skyTemperature`, contrôles
+  `SKY_STALE_KEY=dataStale` et `SKY_STATUS_KEY=infrared.status`, `SKY_MAX_AGE=600` ;
+- `SkyConfig`, `read_sky_payload()`, `SkyFeed` (thread-safe, horodaté), abonnement dans `Publisher`
+  (refait à chaque connexion, suivi à chaud par `listen_sky`), fusion dans la boucle avec priorité au
+  MLX90614 local ; `--print-topics` et le formulaire web suivent automatiquement (`ENV_SCHEMA`) ;
+- 20 tests ajoutés ; suite : **247 passés, 2 ignorés, 1 échec `AF_UNIX` pré-existant sous Windows**,
+  `ruff` OK ;
+- vérifié en direct : message du SQMeter injecté dans le service → `allsky/sky_temperature 23.9` et
+  `status.json` `readings.sky_temperature = 23.9` ;
+- reste à faire sur la Pi : renseigner `SKY_TEMP_TOPIC=sqmeter/state` dans
+  `/etc/allsky-sensors/allsky-sensors.env` (ou via `/reglages`), puis vérifier le journal et le topic.
+  L'anticipation (relever la marge quand le ciel se dégage) reste à concevoir sur des mesures réelles.
+
 **Prochaine session** : étape 7 — déploiement et documentation (README : interface web et sécurité,
-chapitre forçage, installation des deux unités, topics d'état ; compte de tests à jour), puis
-`ReadWritePaths` déjà en place pour `STATE_DIR` sur la Pi. Ensuite, si le besoin se confirme, la
-température du ciel par MQTT ci-dessus.
+chapitre forçage, température du ciel par MQTT, installation des deux unités, topics d'état ; compte
+de tests à jour), puis `ReadWritePaths` déjà en place pour `STATE_DIR` sur la Pi.
 
 
