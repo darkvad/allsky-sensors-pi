@@ -113,7 +113,7 @@ cd /opt/allsky-sensors
 - mesures du MLX90614 manifestement fausses ignorées (hors de -80 à +150 °C) ;
 - GPIO 2, 3 et 4 refusés (I2C et 1-Wire).
 
-## Réglages du chauffage (`/etc/allsky-sensors.env`)
+## Réglages du chauffage (`/etc/allsky-sensors/allsky-sensors.env`)
 
 | Variable | Défaut | Rôle |
 |---|---|---|
@@ -150,11 +150,19 @@ Réseau local uniquement : n'expose jamais ce port à Internet. Pour voir les me
 ## Lancement automatique sur la Pi
 
 ```
-sudo cp allsky-sensors.env.example /etc/allsky-sensors.env && sudo chmod 600 /etc/allsky-sensors.env
-sudoedit /etc/allsky-sensors.env                          # broker, identifiants, chauffage
-sudo cp allsky-sensors.service /etc/systemd/system/       # remplace TON_UTILISATEUR dans ce fichier
-sudo systemctl enable --now allsky-sensors
+sudo install -d -m 750 -o $USER -g $USER /etc/allsky-sensors      # dossier inscriptible par le service web
+sudo install -m 600 -o $USER -g $USER allsky-sensors.env.example /etc/allsky-sensors/allsky-sensors.env
+sudoedit /etc/allsky-sensors/allsky-sensors.env                   # broker, identifiants, chauffage, mot de passe web
+
+# unités : le compte du service est substitué automatiquement, rien à éditer à la main
+sudo install -m 644 allsky-sensors.service allsky-sensors-web.service /etc/systemd/system/
+sudo sed -i "s/^User=.*/User=$(id -un)/" /etc/systemd/system/allsky-sensors.service /etc/systemd/system/allsky-sensors-web.service
+sudo systemctl daemon-reload && sudo systemctl enable --now allsky-sensors allsky-sensors-web
 ```
+
+Si tu préfères éditer l'unité sur place (`/etc/systemd/system/allsky-sensors-web.service`), garde-la
+identique à celle du dépôt : seul `User=` doit différer. Les directives attendues sont rappelées dans
+`PLAN.md` (« Décision du 23/11 »), et un refus d'écriture de `/reglages` nomme désormais celle qui manque.
 
 ## Réglage d'indi-allsky
 

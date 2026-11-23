@@ -1,0 +1,32 @@
+[Unit]
+Description=Interface web des capteurs et du chauffage de l'allsky
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Le compte est substitué à l'installation (voir README) ; à défaut, mets ton compte ici.
+User=TON_UTILISATEUR
+EnvironmentFile=/etc/allsky-sensors/allsky-sensors.env
+Environment=ENV_FILE=/etc/allsky-sensors/allsky-sensors.env
+ExecStart=/opt/allsky-sensors/venv/bin/python /opt/allsky-sensors/web_api.py
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+# Durcissement : le processus n'a besoin ni du matériel, ni de /home, ni d'écrire ailleurs que dans
+# le dossier d'état (consigne de forçage) et le dossier de réglages.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictSUIDSGID=true
+LockPersonality=true
+# Le dossier, et non le fichier : l'écriture est atomique (fichier .tmp puis renommage), ce qui exige un
+# droit d'écriture sur le répertoire. /etc/allsky-sensors appartient au compte du service, mode 750.
+ReadWritePaths=/opt/allsky-sensors/state /etc/allsky-sensors
+
+[Install]
+WantedBy=multi-user.target

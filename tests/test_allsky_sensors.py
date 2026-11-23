@@ -1,7 +1,11 @@
+import json
 import os
 import socket
 import sys
+import time
 from collections import deque
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -50,6 +54,13 @@ def test_five_resistors_at_5_volts():
     assert config.watts_full == pytest.approx(2.66, abs=0.01)
     assert config.max_duty == pytest.approx(0.94, abs=0.01)  # le plafond ne dépend que de la résistance unitaire
     assert config.watts_full * config.max_duty == pytest.approx(2.5, abs=0.01)
+
+
+@pytest.mark.parametrize("value", ["true", "oui", "yes", "2", ""])
+def test_unknown_heater_flag_is_refused(value):
+    """Un « HEATER_ENABLED=true » désactivait le chauffage en silence : c'est maintenant une erreur."""
+    with pytest.raises(ValueError, match="HEATER_ENABLED"):
+        HeaterConfig.from_env({"HEATER_ENABLED": value})
 
 
 def test_config_from_env():
@@ -211,7 +222,8 @@ def test_heater_test_is_capped_and_always_switched_off(mock_gpio, monkeypatch):
 
 
 def run_main(monkeypatch, capsys, args, env):
-    prefixes = ("HEATER_", "MQTT_", "ALTITUDE_", "MLX90614_", "DS18B20_", "BME280_", "ENABLED")
+    env = {"ENV_FILE": "", **env}  # par défaut, aucun fichier réel : tests reproductibles partout
+    prefixes = ("HEATER_", "MQTT_", "ALTITUDE_", "MLX90614_", "DS18B20_", "BME280_", "ENABLED", "STATE_DIR", "ENV_FILE", "WEB_")
     for key in [k for k in os.environ if k.startswith(prefixes)]:
         monkeypatch.delenv(key)
     for key, value in env.items():
@@ -415,3 +427,673 @@ def test_simulation_shows_a_sky_colder_than_the_air(monkeypatch, capsys):
     values = {line.split()[0]: float(line.split()[1]) for line in out.splitlines()}
     assert code == 0
     assert values["allsky/sky_temperature"] < values["allsky/outdoor_temperature"]
+
+
+# ----------------------------------------------------------------------------- forçage du chauffage
+
+
+def override_file(tmp_path, **values):
+    """Fichier de forçage tel que l'écrit l'interface web, avec les défauts surchargeables."""
+    path = tmp_path / "override.json"
+    data = {"version": 1, "mode": "force", "target_c": 18.0, "minutes": 60, "created_at": 0.0, "expires_at": 3600.0, **values}
+    path.write_text(json.dumps(data), encoding="utf-8")
+    return path
+
+
+def keep_override(monkeypatch):
+    """Simule un service déjà lancé : au démarrage, il annule la consigne, ici on la laisse vivre."""
+    monkeypatch.setattr(sensors, "clear_override", lambda _path: False)
+
+
+def published(output):
+    """Valeurs imprimées par --dry-run : topic -> charge utile."""
+    return dict(line.split() for line in output.splitlines() if line.startswith("allsky/"))
+
+
+def test_missing_override_means_automatic_mode(tmp_path):
+    assert sensors.load_override(tmp_path / "absent.json", now=0, max_target_c=35) == (None, None)
+
+
+def test_override_is_bounded_and_deleted_once_expired(tmp_path):
+    path = override_file(tmp_path, target_c=99.0)
+    override, reason = sensors.load_override(path, now=100, max_target_c=35)
+    assert reason is None
+    assert override.target_c == 35.0  # bornée à HEATER_MAX_DOME_TEMP : on ne vise jamais la coupure
+    assert override.remaining(now=100) == pytest.approx(3500)
+    override, reason = sensors.load_override(path, now=3600, max_target_c=35)
+    assert override is None and "expiré" in reason
+    assert not path.exists()  # une consigne expirée est effacée
+
+
+def test_override_expiry_is_capped_to_one_day(tmp_path):
+    path = override_file(tmp_path, expires_at=10**9)  # date absurde, écrite à la main
+    override, _ = sensors.load_override(path, now=1000, max_target_c=35)
+    assert override.expires_at == pytest.approx(1000 + sensors.OVERRIDE_MAX_MINUTES * 60)
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"mode": "off"},  # mode inconnu
+        {"version": 2},
+        {"target_c": "18"},  # du texte
+        {"target_c": True},  # un booléen n'est pas une température
+        {"target_c": None},
+        {"expires_at": "bientôt"},
+        {"expires_at": None},
+    ],
+)
+def test_unusable_override_is_ignored_and_kept(tmp_path, values):
+    path = override_file(tmp_path, **values)
+    override, reason = sensors.load_override(path, now=0, max_target_c=35)
+    assert override is None and reason
+    assert path.exists()  # conservé : il explique ce qui s'est passé
+
+
+def test_broken_override_file_is_ignored(tmp_path):
+    path = tmp_path / "override.json"
+    path.write_text("{ pas du JSON", encoding="utf-8")
+    override, reason = sensors.load_override(path, now=0, max_target_c=35)
+    assert override is None and "illisible" in reason
+
+
+def test_write_override_is_validated_and_readable(tmp_path):
+    path = tmp_path / "state" / "override.json"
+    override = sensors.write_override(path, target_c=20, minutes=30, now=1000.0, max_target_c=35)
+    assert override.expires_at == pytest.approx(1000 + 30 * 60)
+    assert not path.with_name("override.json.tmp").exists()  # écriture atomique : rien ne traîne
+    loaded, reason = sensors.load_override(path, now=1100, max_target_c=35)
+    assert reason is None and loaded.target_c == 20
+    assert loaded.remaining(now=1100) == pytest.approx(30 * 60 - 100)
+
+
+@pytest.mark.parametrize("values", [{"target_c": 50}, {"target_c": -30}, {"minutes": 1}, {"minutes": 5000}])
+def test_write_override_refuses_out_of_range_values(tmp_path, values):
+    arguments = {"target_c": 20, "minutes": 60, **values}
+    with pytest.raises(ValueError, match="forçage"):
+        sensors.write_override(tmp_path / "override.json", now=1000.0, max_target_c=35, **arguments)
+
+
+def test_forced_target_ignores_the_dew_point():
+    controller = make(volts=5)
+    assert controller.update(dome=12.0, dew=11.0, now=0) > 0  # cible automatique 15 °C : il chaufferait
+    assert controller.update(dome=12.0, dew=11.0, now=0, target=12.0) == 0.0  # consigne déjà atteinte
+
+
+def test_forced_target_heats_up_to_the_power_cap():
+    controller = make(volts=5)
+    duties = [controller.update(dome=12.0, dew=4.0, now=step * 10, target=20.0) for step in range(300)]
+    assert duties[0] > 0
+    assert max(duties) <= controller.config.max_duty + 1e-9
+    assert duties[-1] == pytest.approx(controller.config.max_duty)  # écart de 8 °C : plein régime autorisé
+
+
+def test_forced_target_does_not_need_the_dew_point():
+    controller = make()
+    assert controller.update(dome=5.0, dew=None, now=0, target=18.0) > 0
+    assert controller.update(dome=5.0, dew=None, now=300, target=18.0) > 0  # sans rosée depuis 5 min : toléré
+    assert controller.setpoint == pytest.approx(18.0)
+
+
+def test_forced_mode_keeps_the_dome_safeguards():
+    controller = make()
+    assert controller.update(dome=None, dew=None, now=0, target=18.0) == 0.0  # aucune mesure du dôme
+    assert controller.update(dome=5.0, dew=None, now=10, target=18.0) > 0
+    assert controller.update(dome=None, dew=None, now=200, target=18.0) == 0.0  # dôme périmé (> 120 s)
+    assert controller.update(dome=40.0, dew=None, now=210, target=18.0) == 0.0  # dôme déjà trop chaud
+
+
+def test_forced_target_is_capped_to_the_overtemperature_cutoff():
+    controller = make(max_dome_temp=35)
+    assert controller.update(dome=20.0, dew=None, now=0, target=99.0) > 0
+    assert controller.setpoint == pytest.approx(35.0)
+
+
+def test_switching_mode_clears_the_integral():
+    controller = make(volts=5)
+    for step in range(200):  # 33 min de saturation en régulation automatique
+        controller.update(dome=0.0, dew=5.0, now=step * 10)
+    duty = controller.update(dome=19.0, dew=5.0, now=2000, target=20.0)
+    assert duty == pytest.approx(controller.config.kp * controller.config.max_duty, abs=0.02 * controller.config.max_duty)
+    assert controller.update(dome=25.0, dew=5.0, now=2010) == 0.0  # retour en automatique : cible 9 °C
+    assert controller.setpoint == pytest.approx(9.0)
+
+
+def heater_env(tmp_path, **overrides):
+    """Environnement d'un service chauffage actif, sans fichier d'environnement réel."""
+    return {
+        "HEATER_ENABLED": "1",
+        "HEATER_SUPPLY_VOLTS": "12",
+        "STATE_DIR": str(tmp_path),
+        "ENV_FILE": str(tmp_path / "absent.env"),
+        **overrides,
+    }
+
+
+def test_override_is_cleared_when_the_service_starts(tmp_path, monkeypatch, capsys):
+    path = tmp_path / "override.json"
+    sensors.write_override(path, target_c=22.0, minutes=30, now=time.time(), max_target_c=35)
+    code, out = run_main(monkeypatch, capsys, ["--simulate", "--dry-run", "--once"], heater_env(tmp_path))
+    assert code == 0
+    assert not path.exists()  # un redémarrage du service repart en régulation automatique
+    assert published(out)["allsky/heater_mode"] == "auto"
+
+
+def test_forced_mode_is_published(tmp_path, monkeypatch, capsys):
+    path = tmp_path / "override.json"
+    sensors.write_override(path, target_c=22.0, minutes=30, now=time.time(), max_target_c=35)
+    keep_override(monkeypatch)  # service déjà lancé : la consigne en place reste active
+    code, out = run_main(monkeypatch, capsys, ["--simulate", "--dry-run", "--once"], heater_env(tmp_path))
+    values = published(out)
+    assert code == 0
+    assert values["allsky/heater_mode"] == "force"
+    assert float(values["allsky/heater_target"]) == pytest.approx(22.0)
+    assert float(values["allsky/dome_heater_pwm"]) > 0  # le dôme simulé est bien sous la consigne
+
+
+def test_unusable_override_keeps_the_heater_in_automatic_mode(tmp_path, monkeypatch, capsys):
+    (tmp_path / "override.json").write_text('{"mode": "force"}', encoding="utf-8")
+    keep_override(monkeypatch)
+    code, out = run_main(monkeypatch, capsys, ["--simulate", "--dry-run", "--once"], heater_env(tmp_path))
+    assert code == 0
+    assert published(out)["allsky/heater_mode"] == "auto"
+
+
+def test_override_is_dropped_when_the_heater_is_disabled(tmp_path, monkeypatch, capsys):
+    path = tmp_path / "override.json"
+    sensors.write_override(path, target_c=22.0, minutes=30, now=time.time(), max_target_c=35)
+    code, _ = run_main(monkeypatch, capsys, ["--simulate", "--dry-run", "--once"], {"STATE_DIR": str(tmp_path)})
+    assert code == 0
+    assert not path.exists()  # une consigne sans chauffage n'a aucun sens : elle est effacée
+
+
+def test_heater_status_topics_are_not_offered_to_indi_allsky(monkeypatch, capsys):
+    _, out = run_main(monkeypatch, capsys, ["--print-topics"], {"HEATER_ENABLED": "1"})
+    assert "dome_heater_pwm" in out
+    assert "heater_mode" not in out and "heater_target" not in out  # ce ne sont pas des mesures
+
+
+# ----------------------------------------------------------------------------- fichier d'environnement et commandes
+
+
+def test_environment_file_parsing(tmp_path):
+    path = tmp_path / "allsky-sensors.env"
+    path.write_text(
+        "# commentaire\nMQTT_HOST=broker.local\n\nDS18B20_OFFSET_C=3.0\nAVEC_ESPACES = 5 \nQUOTE=\"a b\"\nligne sans egal\n",
+        encoding="utf-8",
+    )
+    assert sensors.read_env_file(path) == {
+        "MQTT_HOST": "broker.local",
+        "DS18B20_OFFSET_C": "3.0",
+        "AVEC_ESPACES": "5",
+        "QUOTE": "a b",
+    }
+
+
+def test_environment_file_tolerates_a_windows_bom(tmp_path):
+    path = tmp_path / "allsky-sensors.env"
+    path.write_text("HEATER_ENABLED=1\n", encoding="utf-8-sig")  # Notepad et consorts ajoutent un BOM
+    assert sensors.read_env_file(path) == {"HEATER_ENABLED": "1"}
+
+
+def test_cli_env_survives_an_unreadable_environment_file(tmp_path, monkeypatch):
+    path = tmp_path / "allsky-sensors.env"
+    path.write_text("HEATER_ENABLED=1\n", encoding="utf-8")
+
+    def unreadable(_path):
+        raise PermissionError("droits insuffisants")
+
+    monkeypatch.setattr(sensors, "read_env_file", unreadable)
+    monkeypatch.setenv("ENV_FILE", str(path))
+    monkeypatch.setenv("STATE_DIR", "ailleurs")
+    assert sensors.cli_env()["STATE_DIR"] == "ailleurs"  # le shell prend le relais, sans planter
+
+
+def test_heater_test_reads_the_environment_file(tmp_path, monkeypatch, capsys):
+    """Régression : lancé par SSH, --heater-test ne voyait ni HEATER_ENABLED ni HEATER_SUPPLY_VOLTS."""
+    env_file = tmp_path / "allsky-sensors.env"
+    env_file.write_text("HEATER_ENABLED=1\nHEATER_SUPPLY_VOLTS=5\n", encoding="utf-8")
+    calls = []
+    monkeypatch.setattr(
+        sensors, "heater_test", lambda config, percent, seconds: calls.append((config.volts, percent, seconds)) or 0
+    )
+    code, _ = run_main(monkeypatch, capsys, ["--heater-test", "20", "--heater-test-seconds", "5"], {"ENV_FILE": str(env_file)})
+    assert code == 0
+    assert calls == [(5.0, 20.0, 5.0)]
+
+
+def test_print_topics_reads_the_environment_file(tmp_path, monkeypatch, capsys):
+    env_file = tmp_path / "allsky-sensors.env"
+    env_file.write_text("ENABLED=bme280\nHEATER_ENABLED=1\nMQTT_PREFIX=meteo\n", encoding="utf-8")
+    code, out = run_main(monkeypatch, capsys, ["--print-topics"], {"ENV_FILE": str(env_file)})
+    assert code == 0
+    assert out.strip().split(",") == [
+        "meteo/outdoor_temperature",
+        "meteo/outdoor_humidity",
+        "meteo/outdoor_pressure",
+        "meteo/outdoor_dew_point",
+        "meteo/dome_heater_pwm",
+    ]
+
+
+def test_state_dir_sits_next_to_the_program_by_default(monkeypatch):
+    monkeypatch.delenv("STATE_DIR", raising=False)
+    assert sensors.override_path() == Path(sensors.__file__).resolve().parent / "state" / "override.json"
+    monkeypatch.setenv("STATE_DIR", "D:/ailleurs")
+    assert sensors.override_path() == Path("D:/ailleurs/override.json")
+
+
+def test_heater_force_records_a_setpoint(tmp_path, monkeypatch, capsys):
+    code, _ = run_main(monkeypatch, capsys, ["--heater-force", "18"], heater_env(tmp_path))
+    assert code == 0
+    override, reason = sensors.load_override(tmp_path / "override.json", now=time.time(), max_target_c=35)
+    assert reason is None and override.target_c == 18.0
+    assert override.remaining(time.time()) == pytest.approx(60 * 60, abs=60)  # 60 min par défaut
+
+
+def test_heater_force_accepts_a_custom_duration(tmp_path, monkeypatch, capsys):
+    code, _ = run_main(monkeypatch, capsys, ["--heater-force", "20", "--heater-force-minutes", "15"], heater_env(tmp_path))
+    assert code == 0
+    override, _ = sensors.load_override(tmp_path / "override.json", now=time.time(), max_target_c=35)
+    assert override.remaining(time.time()) == pytest.approx(15 * 60, abs=60)
+
+
+def test_heater_force_needs_the_heater_enabled(tmp_path, monkeypatch, capsys):
+    env = {"STATE_DIR": str(tmp_path), "ENV_FILE": str(tmp_path / "absent.env")}
+    code, _ = run_main(monkeypatch, capsys, ["--heater-force", "18"], env)
+    assert code == 2
+    assert not (tmp_path / "override.json").exists()
+
+
+def test_heater_force_refuses_a_target_above_the_safety_cutoff(tmp_path, monkeypatch, capsys):
+    code, _ = run_main(monkeypatch, capsys, ["--heater-force", "40"], heater_env(tmp_path))  # HEATER_MAX_DOME_TEMP=35
+    assert code == 2
+    assert not (tmp_path / "override.json").exists()
+
+
+def test_heater_force_reads_the_environment_file(tmp_path, monkeypatch, capsys):
+    env_file = tmp_path / "allsky-sensors.env"
+    env_file.write_text(f"HEATER_ENABLED=1\nHEATER_SUPPLY_VOLTS=5\nSTATE_DIR={tmp_path}\n", encoding="utf-8")
+    code, _ = run_main(monkeypatch, capsys, ["--heater-force", "18"], {"ENV_FILE": str(env_file)})
+    assert code == 0
+    override, reason = sensors.load_override(tmp_path / "override.json", now=time.time(), max_target_c=35)
+    assert reason is None and override.target_c == 18.0
+
+
+def test_heater_cancel_removes_the_setpoint(tmp_path, monkeypatch, capsys):
+    path = tmp_path / "override.json"
+    sensors.write_override(path, 18, 30, time.time(), 35)
+    code, _ = run_main(monkeypatch, capsys, ["--heater-cancel"], heater_env(tmp_path))
+    assert code == 0 and not path.exists()
+    code, _ = run_main(monkeypatch, capsys, ["--heater-cancel"], heater_env(tmp_path))  # déjà en automatique
+    assert code == 0
+
+
+# ----------------------------------------------------------------------------- commandes MQTT
+
+
+def test_mqtt_command_forces_a_target(tmp_path):
+    path = tmp_path / "override.json"
+    report = sensors.apply_heater_command("18", HeaterConfig(volts=12), path, now=1000.0)
+    assert "18 °C" in report and "60 min" in report
+    override, reason = sensors.load_override(path, now=1001, max_target_c=35)
+    assert reason is None and override.target_c == 18.0
+
+
+def test_mqtt_command_accepts_a_duration_and_a_french_decimal(tmp_path):
+    path = tmp_path / "override.json"
+    sensors.apply_heater_command("17,5 30", HeaterConfig(volts=12), path, now=1000.0)
+    override, _ = sensors.load_override(path, now=1001, max_target_c=35)
+    assert override.target_c == pytest.approx(17.5)
+    assert override.expires_at == pytest.approx(1000 + 30 * 60)
+
+
+def test_mqtt_cancel_command_drops_the_setpoint(tmp_path):
+    path = tmp_path / "override.json"
+    sensors.write_override(path, 18, 30, 1000.0, 35)
+    assert "annulée" in sensors.apply_heater_command("cancel", HeaterConfig(volts=12), path, now=1001.0)
+    assert not path.exists()
+    assert "déjà" in sensors.apply_heater_command("cancel", HeaterConfig(volts=12), path, now=1002.0)
+
+
+@pytest.mark.parametrize("text", ["", "chaud", "18 chaud", "18 30 40", "40", "18 1"])
+def test_mqtt_command_refuses_garbage(tmp_path, text):
+    path = tmp_path / "override.json"
+    with pytest.raises(ValueError):
+        sensors.apply_heater_command(text, HeaterConfig(volts=12), path, now=1000.0)
+    assert not path.exists()  # une commande refusée ne laisse jamais de consigne derrière elle
+
+
+def test_mqtt_message_text_reaches_the_handler():
+    received = []
+    publisher = sensors.Publisher("localhost", 1883, "", "", dry_run=True)
+    publisher._on_command = received.append
+    publisher._on_message(None, None, SimpleNamespace(payload=b"18 30"))
+    publisher._on_message(None, None, SimpleNamespace(payload=b"annuler"))
+    assert received == ["18 30", "annuler"]
+
+
+def test_mqtt_messages_are_ignored_when_no_command_is_expected():
+    publisher = sensors.Publisher("localhost", 1883, "", "", dry_run=True)  # aucune souscription prévue
+    publisher._on_message(None, None, SimpleNamespace(payload=b"18"))  # sans effet et sans erreur
+
+
+def test_mqtt_command_error_never_escapes_the_callback():
+    def boom(_text):
+        raise RuntimeError("panne simulée")
+
+    publisher = sensors.Publisher("localhost", 1883, "", "", dry_run=True)
+    publisher._on_command = boom
+    publisher._on_message(None, None, SimpleNamespace(payload=b"18"))  # avalé et journalisé
+
+
+def test_subscription_result_is_logged(caplog):
+    with caplog.at_level("INFO", logger="allsky-sensors"):
+        sensors.Publisher._on_subscribe(None, None, 1, 0)
+    assert "accepté" in caplog.text
+    caplog.clear()
+    with caplog.at_level("INFO", logger="allsky-sensors"):
+        sensors.Publisher._on_subscribe(None, None, 1, 128)  # droits refusés par le broker
+    assert "refusé" in caplog.text
+
+
+def test_service_announces_a_disabled_heater(tmp_path, monkeypatch, capsys, caplog):
+    env = {"STATE_DIR": str(tmp_path), "ENV_FILE": str(tmp_path / "absent.env")}
+    with caplog.at_level("INFO", logger="allsky-sensors"):
+        code, _ = run_main(monkeypatch, capsys, ["--simulate", "--dry-run", "--once"], env)
+    assert code == 0
+    assert "chauffage désactivé" in caplog.text  # la raison de l'absence de commande est dite
+
+
+# ----------------------------------------------------------------------------- schéma, validation, réglages
+
+EXAMPLE_ENV = Path(__file__).resolve().parent.parent / "allsky-sensors.env.example"
+
+
+def parameter(name):
+    return next(item for item in sensors.ENV_SCHEMA if item.name == name)
+
+
+def test_schema_describes_every_variable_of_the_example_file():
+    documented = set(sensors.read_env_file(EXAMPLE_ENV))
+    assert documented <= sensors.ENV_KEYS  # chaque variable documentée est décrite par le schéma
+    assert len(sensors.ENV_SCHEMA) == len(sensors.ENV_KEYS)  # pas de doublon
+    for item in sensors.ENV_SCHEMA:
+        assert item.section and item.label and item.kind
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "valid"),
+    [
+        ("INTERVAL", "60", True),
+        ("INTERVAL", "60.5", False),  # un entier, pas un flottant
+        ("INTERVAL", "soixante", False),
+        ("INTERVAL", "5", False),
+        ("HEATER_MARGIN", "4,5", True),  # virgule décimale acceptée
+        ("HEATER_MARGIN", "15", False),
+        ("ENABLED", "bme280, mlx90614", True),
+        ("ENABLED", "bme280,lunaire", False),
+        ("ENABLED", "", False),
+        ("GPIO_RESERVED", "17,18,22,27", True),
+        ("GPIO_RESERVED", "17,40", False),
+        ("BME280_ADDRESS", "0x77", True),
+        ("BME280_ADDRESS", "0x80", False),
+        ("BME280_ADDRESS", "76", True),  # hexadécimal sans préfixe
+        ("WEB_PASSWORD", "mot-de-passe-solide", True),
+        ("WEB_PASSWORD", "court", False),
+        ("ALTITUDE_M", "", True),  # facultative
+        ("HEATER_ENABLED", "2", False),
+        ("MQTT_PORT", "1883", True),
+        ("MQTT_PORT", "70000", False),
+    ],
+)
+def test_parameter_validation(name, value, valid):
+    message = parameter(name).validate_value(value)
+    assert (message is None) is valid
+
+
+def test_empty_environment_is_valid():
+    assert sensors.validate_env({}) == []
+    assert sensors.validate_env({"ENABLED": "bme280,ds18b20", "DS18B20_OFFSET_C": ""}) == []  # vide = 0
+
+
+def test_validation_reports_every_problem():
+    errors = sensors.validate_env({"INTERVAL": "2", "ENABLED": "bme280,lunaire", "HEATER_ENABLED": "1"})
+    assert len(errors) == 3
+    assert any("ENABLED" in message for message in errors)
+    assert any("HEATER_SUPPLY_VOLTS" in message for message in errors)
+
+
+def test_settings_read_values_and_defaults():
+    settings = sensors.Settings.from_env(
+        {"INTERVAL": "30", "ENABLED": "bme280,mlx90614", "ALTITUDE_M": "500", "MQTT_HOST": "broker.lan"}
+    )
+    assert settings.interval == 30
+    assert settings.enabled == ("bme280", "mlx90614")
+    assert settings.altitude == 500
+    assert settings.heater is None and settings.mqtt.host == "broker.lan"
+    default = sensors.Settings.from_env({})
+    assert default.interval == 60 and default.enabled == ("bme280", "ds18b20") and default.altitude is None
+
+
+def test_settings_accepts_french_decimals_and_hex_addresses():
+    settings = sensors.Settings.from_env(
+        {"HEATER_ENABLED": "1", "HEATER_SUPPLY_VOLTS": "12", "HEATER_MARGIN": "4,5", "MLX90614_ADDRESS": "0x5b"}
+    )
+    assert settings.heater.margin == pytest.approx(4.5)
+    assert settings.mlx90614_address == 0x5B
+
+
+def test_settings_refuses_an_invalid_file():
+    with pytest.raises(sensors.ConfigError) as failure:
+        sensors.Settings.from_env({"HEATER_MARGIN": "50"})
+    assert failure.value.messages and "HEATER_MARGIN" in failure.value.messages[0]
+
+
+def test_env_update_keeps_comments_and_unknown_variables(tmp_path):
+    path = tmp_path / "allsky-sensors.env"
+    original = EXAMPLE_ENV.read_text(encoding="utf-8").replace(
+        "HEATER_MARGIN=4", "HEATER_MARGIN=4\n# ajouté à la main\nMA_VARIABLE=a moi"
+    )
+    path.write_text(original, encoding="utf-8")
+    sensors.update_env_file(path, {"HEATER_MARGIN": "6", "ALTITUDE_M": "900"})
+    text = path.read_text(encoding="utf-8")
+    assert "HEATER_MARGIN=6" in text and "HEATER_MARGIN=4\n" not in text
+    assert "MA_VARIABLE=a moi" in text and text.count("# ajouté à la main") == 1
+    assert text.count("#") >= original.count("#")  # aucun commentaire perdu
+    assert text.splitlines()[-1] == "ALTITUDE_M=900"  # clé absente (commentée) : ajoutée en fin de fichier
+    assert not text.endswith("\n\n")  # pas de lignes vides en fin de fichier
+
+
+def test_env_update_makes_a_backup_and_a_private_file(tmp_path):
+    path = tmp_path / "allsky-sensors.env"
+    path.write_text("INTERVAL=60\n", encoding="utf-8")
+    sensors.update_env_file(path, {"INTERVAL": "30"})
+    backup = path.with_name("allsky-sensors.env.bak")
+    assert backup.read_text(encoding="utf-8") == "INTERVAL=60\n"
+    assert not path.with_name("allsky-sensors.env.tmp").exists()
+    if os.name != "nt":  # Windows ne gère pas les permissions POSIX
+        assert path.stat().st_mode & 0o777 == 0o600
+        assert backup.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"VARIABLE_INCONNUE": "1"}, "clé inconnue"),
+        ({"INTERVAL": "30\nHEATER_ENABLED=1"}, "saut de ligne"),
+        ({"INTERVAL": "30\r\nHEATER_ENABLED=1"}, "saut de ligne"),
+    ],
+)
+def test_env_update_refuses_injection(tmp_path, changes, message):
+    path = tmp_path / "allsky-sensors.env"
+    path.write_text("INTERVAL=60\n", encoding="utf-8")
+    with pytest.raises(ValueError, match=message):
+        sensors.update_env_file(path, changes)
+    assert path.read_text(encoding="utf-8") == "INTERVAL=60\n"  # rien n'a bougé
+
+
+def test_env_update_creates_a_missing_file(tmp_path):
+    path = tmp_path / "nouveau" / "allsky-sensors.env"
+    sensors.update_env_file(path, {"INTERVAL": "45"})
+    assert path.read_text(encoding="utf-8") == "INTERVAL=45\n"
+
+
+def test_env_update_tolerates_a_bom(tmp_path):
+    path = tmp_path / "allsky-sensors.env"
+    path.write_text("INTERVAL=60\n", encoding="utf-8-sig")
+    sensors.update_env_file(path, {"INTERVAL": "30"})
+    assert sensors.read_env_file(path)["INTERVAL"] == "30"
+    assert not path.read_bytes().startswith(b"\xef\xbb\xbf")  # le BOM disparaît
+
+
+def test_status_round_trip(tmp_path):
+    path = tmp_path / "status.json"
+    sensors.write_status(path, {"mode": "auto", "duty_pct": 0.0})
+    assert sensors.read_status(path) == {"version": 1, "mode": "auto", "duty_pct": 0.0}
+    if os.name != "nt":
+        assert path.stat().st_mode & 0o777 == 0o644  # lisible par l'interface web
+
+
+def test_status_is_ignored_when_missing_or_broken(tmp_path):
+    path = tmp_path / "status.json"
+    assert sensors.read_status(path) is None
+    path.write_text("{ pas du JSON", encoding="utf-8")
+    assert sensors.read_status(path) is None
+    path.write_text('{"version": 99, "mode": "auto"}', encoding="utf-8")
+    assert sensors.read_status(path) is None
+
+
+def test_status_path_follows_state_dir(tmp_path):
+    assert sensors.status_path({"STATE_DIR": str(tmp_path)}) == tmp_path / "status.json"
+
+
+# ----------------------------------------------------------------------------- état publié et rechargement à chaud
+
+
+def test_settings_read_the_state_directory(tmp_path):
+    assert sensors.Settings.from_env({"STATE_DIR": str(tmp_path)}).state_dir == tmp_path
+    assert sensors.Settings.from_env({}).state_dir == sensors.STATE_DIR_DEFAULT
+
+
+def test_service_publishes_its_state_for_the_web(tmp_path, monkeypatch, capsys):
+    code, _ = run_main(monkeypatch, capsys, ["--simulate", "--dry-run", "--once"], heater_env(tmp_path))
+    assert code == 0
+    status = sensors.read_status(tmp_path / "status.json")
+    assert status is not None
+    assert status["mode"] == "auto" and status["config_error"] is None
+    assert status["dome_c"] is not None and status["dew_c"] is not None
+    assert 0 <= status["duty_pct"] <= 100
+    assert status["readings"]["dome_temperature"] == status["dome_c"]
+    assert status["pid"] > 0 and status["settings_mtime"] is None  # pas de fichier surveillé ici
+
+
+def test_heater_state_is_published_at_every_tick_not_only_every_minute(tmp_path, monkeypatch, capsys):
+    """Une interface de pilotage doit voir la PWM changer vite : 10 s, pas 60 s."""
+    calls = []
+
+    def fake_wait(_event, timeout=None):
+        calls.append(timeout)
+        if len(calls) >= 3:
+            _event.set()
+        return False
+
+    monkeypatch.setattr(sensors.threading.Event, "wait", fake_wait)
+    code, out = run_main(monkeypatch, capsys, ["--simulate", "--dry-run"], heater_env(tmp_path))
+    assert code == 0
+    assert out.count("allsky/dome_heater_pwm") == 3  # un envoi par tick
+    assert out.count("allsky/outdoor_temperature") == 1  # les mesures restent à INTERVAL
+    assert calls == [sensors.HEATER_TICK_SECONDS] * 3
+
+
+def test_service_reloads_the_environment_file(tmp_path, monkeypatch, capsys, caplog):
+    envelope = tmp_path / "allsky-sensors.env"
+
+    def write(margin):
+        envelope.write_text(
+            f"ENABLED=bme280,ds18b20\nINTERVAL=60\nHEATER_ENABLED=1\nHEATER_SUPPLY_VOLTS=12\n"
+            f"HEATER_MARGIN={margin}\nSTATE_DIR={tmp_path}\n",
+            encoding="utf-8",
+        )
+
+    write(4)
+    calls = []
+
+    def fake_wait(_event, timeout=None):
+        calls.append(timeout)
+        if len(calls) == 1:
+            write(6)  # modifier le fichier pendant le service : il doit être rechargé au tick suivant
+        else:
+            _event.set()
+        return False
+
+    monkeypatch.setattr(sensors.threading.Event, "wait", fake_wait)
+    with caplog.at_level("INFO", logger="allsky-sensors"):
+        code, _ = run_main(monkeypatch, capsys, ["--simulate", "--dry-run"], {"ENV_FILE": str(envelope), "STATE_DIR": str(tmp_path)})
+    assert code == 0
+    assert "configuration rechargée depuis" in caplog.text
+    status = sensors.read_status(tmp_path / "status.json")
+    assert status is not None and status["settings_mtime"] is not None
+    assert status["target_c"] == pytest.approx(status["dew_c"] + 6)  # la nouvelle marge est appliquée
+
+
+def test_invalid_reloaded_configuration_is_ignored(tmp_path, monkeypatch, capsys, caplog):
+    envelope = tmp_path / "allsky-sensors.env"
+    envelope.write_text(f"INTERVAL=60\nHEATER_MARGIN=4\nSTATE_DIR={tmp_path}\n", encoding="utf-8")
+    calls = []
+
+    def fake_wait(_event, timeout=None):
+        calls.append(timeout)
+        if len(calls) == 1:
+            envelope.write_text("HEATER_MARGIN=50\n", encoding="utf-8")  # hors bornes
+        else:
+            _event.set()
+        return False
+
+    monkeypatch.setattr(sensors.threading.Event, "wait", fake_wait)
+    with caplog.at_level("INFO", logger="allsky-sensors"):
+        code, _ = run_main(monkeypatch, capsys, ["--simulate", "--dry-run"], {"ENV_FILE": str(envelope), "STATE_DIR": str(tmp_path)})
+    assert code == 0  # le service continue
+    assert "configuration non appliquée" in caplog.text
+    status = sensors.read_status(tmp_path / "status.json")
+    assert status is not None and "HEATER_MARGIN" in status["config_error"]  # visible sur le web
+
+
+def test_service_reads_its_configuration_from_the_environment_file(tmp_path, monkeypatch, capsys, caplog):
+    """Régression : une unité systemd mal écrite ne doit plus laisser le service sans configuration."""
+    path = tmp_path / "allsky-sensors.env"
+    path.write_text(
+        f"ENABLED=bme280,ds18b20\nHEATER_ENABLED=1\nHEATER_SUPPLY_VOLTS=12\nSTATE_DIR={tmp_path}\n", encoding="utf-8"
+    )
+    with caplog.at_level("INFO", logger="allsky-sensors"):
+        code, out = run_main(monkeypatch, capsys, ["--simulate", "--dry-run", "--once"], {"ENV_FILE": str(path)})
+    assert code == 0
+    assert "chauffage : 6 x 47 ohm" in caplog.text  # réglages lus dans le fichier, pas dans l'environnement
+    assert "allsky/heater_mode" in out
+
+
+def test_service_env_prefers_the_file_over_the_process_environment(tmp_path, monkeypatch):
+    path = tmp_path / "allsky-sensors.env"
+    path.write_text("INTERVAL=30\n", encoding="utf-8")
+    monkeypatch.setenv("ENV_FILE", str(path))
+    monkeypatch.setenv("INTERVAL", "60")
+    values = sensors.service_env()
+    assert values["INTERVAL"] == "30"  # le fichier est la source de vérité, puisqu'il est rechargé à chaud
+    assert values["PATH"] == os.environ["PATH"]  # le reste de l'environnement est conservé
+
+
+def test_empty_env_file_setting_disables_the_watch(monkeypatch):
+    monkeypatch.setenv("ENV_FILE", "")
+    assert sensors.configured_env_file() is None
+
+
+def test_default_environment_file_is_used_when_the_unit_forgets_it(tmp_path, monkeypatch):
+    path = tmp_path / "allsky-sensors.env"
+    path.write_text("INTERVAL=45\n", encoding="utf-8")
+    monkeypatch.delenv("ENV_FILE", raising=False)
+    monkeypatch.setattr(sensors, "DEFAULT_ENV_FILE", path)
+    assert sensors.configured_env_file() == path
+    assert sensors.service_env()["INTERVAL"] == "45"
+    monkeypatch.setattr(sensors, "DEFAULT_ENV_FILE", tmp_path / "absent.env")
+    assert sensors.configured_env_file() is None  # aucun fichier à surveiller : l'environnement suffit
+

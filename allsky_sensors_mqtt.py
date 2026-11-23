@@ -8,6 +8,12 @@ Capteurs :
 Chauffage anti-buée (facultatif, HEATER_ENABLED=1) :
   - commande PWM d'un module MOSFET alimentant des résistances ; régulation de la température du dôme
     à (point de rosée + marge) ; le rapport cyclique appliqué est publié (dome_heater_pwm, en %).
+  - forçage ponctuel : une consigne (override.json, dossier STATE_DIR) vise une température donnée sans
+    tenir compte du point de rosée ; elle peut être déposée par l'interface web, par la commande
+    --heater-force, ou reçue par MQTT (<préfixe>/heater_command : « 18 », « 18 30 » ou « cancel »).
+    La consigne expire et ne contourne aucune sécurité (plafond de puissance, coupure en surchauffe,
+    mesure périmée). Le mode employé est publié (heater_mode : auto ou force) ainsi que la cible
+    effective (heater_target, en °C).
 
 Chaque valeur est publiée en texte brut (un nombre par topic) pour le capteur « MQTT Broker »
 d'indi-allsky. Configuration par variables d'environnement (voir allsky-sensors.env.example).
@@ -18,9 +24,11 @@ Essais sans matériel ni broker :  python3 allsky_sensors_mqtt.py --simulate --d
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import math
 import os
+import re
 import signal
 import socket
 import threading
@@ -41,7 +49,23 @@ SENSOR_TOPICS = {
     "mlx90614": ("sky_temperature",),
 }
 HEATER_TOPIC = "dome_heater_pwm"
+HEATER_MODE_TOPIC = "heater_mode"  # « auto » ou « force »
+HEATER_TARGET_TOPIC = "heater_target"  # cible effective en °C (jamais listée dans --print-topics)
+HEATER_COMMAND_TOPIC = "heater_command"  # « 18 », « 18 30 » ou « cancel » : consigne pour le service en marche
 W1_DEVICES = Path("/sys/bus/w1/devices")
+
+# État du programme (consigne de forçage, état publié pour l'interface web) : sous-dossier du programme,
+# donc /opt/allsky-sensors/state sur la Pi ; la variable STATE_DIR permet de le déplacer.
+STATE_DIR_DEFAULT = Path(__file__).resolve().parent / "state"
+OVERRIDE_FILENAME = "override.json"
+STATUS_FILENAME = "status.json"
+STATUS_VERSION = 1
+DEFAULT_ENV_FILE = Path("/etc/allsky-sensors/allsky-sensors.env")  # fichier d'environnement systemd, lu par --heater-force
+OVERRIDE_VERSION = 1
+OVERRIDE_MIN_MINUTES = 5
+OVERRIDE_MAX_MINUTES = 24 * 60
+OVERRIDE_DEFAULT_MINUTES = 60
+FORCE_MIN_C = -20.0  # plancher de vraisemblance d'une consigne forcée (°C)
 
 HEATER_TICK_SECONDS = 10  # période de régulation quand le chauffage est actif
 MAX_TICK_SECONDS = 30  # le chien de garde systemd attend un signe de vie plus souvent que cela
@@ -162,32 +186,654 @@ class HeaterConfig:
     @classmethod
     def from_env(cls, env: Mapping[str, str] = os.environ) -> HeaterConfig | None:
         """Configuration du chauffage, ou None s'il est désactivé. Lève ValueError si elle est invalide."""
-        if env.get("HEATER_ENABLED", "0") != "1":
+        enabled = env.get("HEATER_ENABLED", "0").strip()
+        if enabled not in ("0", "1"):  # « true », « oui »… sont des pièges : on refuse plutôt que d'ignorer
+            raise ValueError(f"HEATER_ENABLED doit valoir 0 ou 1 (reçu : {enabled!r})")
+        if enabled != "1":
             return None
         if "HEATER_SUPPLY_VOLTS" not in env:
             raise ValueError("HEATER_SUPPLY_VOLTS doit être défini : tension d'alimentation du chauffage, en volts")
         config = cls(
-            volts=float(env["HEATER_SUPPLY_VOLTS"]),
-            gpio=int(env.get("HEATER_GPIO", "23")),
+            volts=_as_float(env["HEATER_SUPPLY_VOLTS"]),
+            gpio=int(_as_float(env.get("HEATER_GPIO"), 23)),
             reserved=tuple(int(n) for n in env.get("GPIO_RESERVED", "").split(",") if n.strip()),
-            pwm_hz=int(env.get("HEATER_PWM_HZ", "100")),
-            resistors=int(env.get("HEATER_RESISTORS", "6")),
-            ohms=float(env.get("HEATER_RESISTOR_OHMS", "47")),
-            rating_watts=float(env.get("HEATER_RESISTOR_RATING_WATTS", "1")),
-            margin=float(env.get("HEATER_MARGIN", "4")),
-            max_dome_temp=float(env.get("HEATER_MAX_DOME_TEMP", "35")),
-            kp=float(env.get("HEATER_KP", "0.3")),
-            ki=float(env.get("HEATER_KI", "0.0002")),
+            pwm_hz=int(_as_float(env.get("HEATER_PWM_HZ"), 100)),
+            resistors=int(_as_float(env.get("HEATER_RESISTORS"), 6)),
+            ohms=_as_float(env.get("HEATER_RESISTOR_OHMS"), 47),
+            rating_watts=_as_float(env.get("HEATER_RESISTOR_RATING_WATTS"), 1),
+            margin=_as_float(env.get("HEATER_MARGIN"), 4),
+            max_dome_temp=_as_float(env.get("HEATER_MAX_DOME_TEMP"), 35),
+            kp=_as_float(env.get("HEATER_KP"), 0.3),
+            ki=_as_float(env.get("HEATER_KI"), 0.0002),
         )
         config.validate()
         return config
 
 
+# --------------------------------------------------------------------------- fichier d'environnement
+
+
+def read_env_file(path: Path) -> dict[str, str]:
+    """Variables d'un fichier d'environnement systemd : lignes ``CLE=valeur``, ``#`` commentaire.
+
+    Les lignes qui ne sont pas de simples affectations sont ignorées : le fichier reste la propriété
+    de l'utilisateur (commentaires, ordre, variables inconnues), on n'en lit que ce qui est compris.
+    """
+    values: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8-sig").splitlines():  # utf-8-sig : tolère un BOM (éditeur Windows)
+        text = line.strip()
+        if not text or text.startswith("#") or "=" not in text:
+            continue
+        key, _, value = text.partition("=")
+        key, value = key.strip(), value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        if key:
+            values[key] = value
+    return values
+
+
+def _write_private(path: Path, content: str) -> None:
+    """Écrit un fichier en une seule opération : temporaire, permissions 600, sauvegarde ``.bak``."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if path.exists():
+        backup = path.with_name(path.name + ".bak")
+        backup.write_text(path.read_text(encoding="utf-8-sig"), encoding="utf-8")
+        os.chmod(backup, 0o600)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(content, encoding="utf-8")
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, path)
+
+
+def update_env_file(path: Path, changes: Mapping[str, str]) -> None:
+    """Met à jour des variables dans un fichier d'environnement systemd, sans le réécrire.
+
+    Seules les clés du schéma sont acceptées (impossible d'injecter une variable arbitraire), les
+    valeurs ne peuvent pas contenir de saut de ligne. Commentaires, ordre et variables inconnues sont
+    préservés ; une clé absente est ajoutée en fin de fichier. Écriture atomique, mode 600 et copie
+    ``.bak`` : soit l'ancien fichier, soit le nouveau, jamais un fichier tronqué.
+    """
+    unknown = sorted(set(changes) - ENV_KEYS)
+    if unknown:
+        raise ValueError(f"clé inconnue : {', '.join(unknown)}")
+    for key, value in changes.items():
+        if any(character in value for character in "\r\n\0"):
+            raise ValueError(f"{key} : une valeur ne peut pas contenir de saut de ligne")
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except FileNotFoundError:
+        text = ""
+    lines = text.splitlines()
+    for key, value in changes.items():
+        pattern = re.compile(rf"^\s*{re.escape(key)}\s*=")
+        for index, line in enumerate(lines):
+            if pattern.match(line):
+                lines[index] = f"{key}={value}"
+                break
+        else:
+            lines.append(f"{key}={value}")
+    while lines and not lines[-1].strip():
+        lines.pop()
+    _write_private(path, "\n".join(lines) + "\n")
+
+
+def cli_env() -> dict[str, str]:
+    """Environnement effectif d'une commande lancée à la main (par SSH, par exemple).
+
+    Le service reçoit son environnement de systemd ; ici, on lit d'abord le fichier d'environnement
+    (ENV_FILE, par défaut /etc/allsky-sensors/allsky-sensors.env), puis os.environ, qui garde la priorité. Un fichier
+    illisible (droits root, par exemple) donne un avertissement clair plutôt qu'un plantage.
+    """
+    path = Path(os.getenv("ENV_FILE", str(DEFAULT_ENV_FILE)))
+    values: dict[str, str] = {}
+    if path.is_file():
+        try:
+            values = read_env_file(path)
+        except OSError as error:
+            log.warning("%s illisible (%s) : seules les variables du shell sont prises en compte", path, error)
+    return {**values, **os.environ}
+
+
+# --------------------------------------------------------------------------- configuration
+
+
+def _split_list(text: str) -> list[str]:
+    """Éléments d'une liste séparée par des virgules, vides ignorés."""
+    return [word.strip() for word in text.split(",") if word.strip()]
+
+
+def _number_from_text(text: str, kind: str) -> float | None:
+    """Nombre lu dans une valeur de fichier (« 4,5 » accepté), ou None si ce n'est pas un nombre."""
+    if kind == "hex":
+        try:
+            return float(int(text, 16))
+        except ValueError:
+            return None
+    try:
+        value = float(text.replace(",", "."))
+    except ValueError:
+        return None
+    if kind == "int" and not value.is_integer():
+        return None
+    return value
+
+
+def _as_float(text: str | None, default: float = 0.0) -> float:
+    """Nombre d'une variable d'environnement, ``default`` si elle est absente ou vide."""
+    cleaned = "" if text is None else text.strip().replace(",", ".")
+    return float(cleaned) if cleaned else default
+
+
+@dataclass(frozen=True)
+class Param:
+    """Descripteur d'une variable du fichier d'environnement (validation, formulaire web, doc)."""
+
+    name: str
+    section: str
+    label: str
+    kind: str  # text, secret, int, float, flag, ints, sensors, hex
+    default: str | None = None
+    minimum: float | None = None
+    maximum: float | None = None
+    min_length: int = 0
+    unit: str = ""
+    help: str = ""
+    choices: tuple[str, ...] = ()
+    allow_empty: bool = False  # une valeur vide a un sens (variable facultative)
+    restart: bool = False  # pris en compte seulement au redémarrage du service
+
+    @property
+    def suffix(self) -> str:
+        return f" {self.unit}" if self.unit else ""
+
+    def _bounds_error(self, number: float) -> str | None:
+        if self.minimum is not None and number < self.minimum:
+            return f"{self.name} doit être au moins {self.minimum:g}{self.suffix}"
+        if self.maximum is not None and number > self.maximum:
+            return f"{self.name} doit être au plus {self.maximum:g}{self.suffix}"
+        return None
+
+    def validate_value(self, value: str) -> str | None:
+        """Message d'erreur pour une valeur présente dans le fichier, ou None si elle convient."""
+        text = value.strip()
+        if not text:
+            return None if self.allow_empty else f"{self.name} ne peut pas être vide"
+        if self.kind in ("text", "secret"):
+            if len(text) < self.min_length:
+                return f"{self.name} doit compter au moins {self.min_length} caractères"
+            return None
+        if self.kind == "flag":
+            return None if text in ("0", "1") else f"{self.name} doit valoir 0 ou 1"
+        if self.kind == "sensors":
+            unknown = [name for name in _split_list(text) if name not in SENSOR_TOPICS]
+            if unknown:
+                return f"{self.name} : capteur inconnu ({', '.join(unknown)}) ; attendu : {', '.join(SENSOR_TOPICS)}"
+            if not _split_list(text):
+                return f"{self.name} doit nommer au moins un capteur"
+            return None
+        if self.kind == "ints":
+            for word in _split_list(text):
+                if not word.isdigit() or not 0 <= int(word) <= 27:
+                    return f"{self.name} : « {word} » n'est pas un numéro de GPIO (0 à 27)"
+            return None
+        number = _number_from_text(text, self.kind)
+        if number is None:
+            return f"{self.name} : « {text} » n'est pas un nombre"
+        return self._bounds_error(number)
+
+
+ENV_SCHEMA: tuple[Param, ...] = (
+    Param("MQTT_HOST", "Broker MQTT", "Adresse du broker", "text", default="localhost", help="nom ou IP du serveur Mosquitto"),
+    Param("MQTT_PORT", "Broker MQTT", "Port du broker", "int", default="1883", minimum=1, maximum=65535),
+    Param("MQTT_USER", "Broker MQTT", "Utilisateur MQTT", "text", default="", allow_empty=True),
+    Param("MQTT_PASSWORD", "Broker MQTT", "Mot de passe MQTT", "secret", default="", allow_empty=True),
+    Param("MQTT_PREFIX", "Broker MQTT", "Préfixe des topics", "text", default="allsky", restart=True),
+    Param(
+        "ENABLED",
+        "Capteurs",
+        "Capteurs lus",
+        "sensors",
+        default=DEFAULT_SENSORS,
+        help="bme280 (extérieur), ds18b20 (dôme), mlx90614 (ciel)",
+    ),
+    Param("BME280_ADDRESS", "Capteurs", "Adresse I2C du BME280", "hex", default="0x76", minimum=0x08, maximum=0x77),
+    Param(
+        "ALTITUDE_M",
+        "Capteurs",
+        "Altitude du capteur",
+        "float",
+        minimum=-500,
+        maximum=9000,
+        unit="m",
+        allow_empty=True,
+        help="si renseignée : pression ramenée au niveau de la mer",
+    ),
+    Param("DS18B20_ID", "Capteurs", "Identifiant du DS18B20 du dôme", "text", default="", allow_empty=True),
+    Param(
+        "DS18B20_OFFSET_C",
+        "Capteurs",
+        "Correction du DS18B20",
+        "float",
+        default="0",
+        minimum=-10,
+        maximum=10,
+        unit="°C",
+        allow_empty=True,
+    ),
+    Param("MLX90614_ADDRESS", "Capteurs", "Adresse I2C du MLX90614", "hex", default="0x5A", minimum=0x08, maximum=0x77),
+    Param(
+        "MLX90614_OFFSET_C",
+        "Capteurs",
+        "Correction du MLX90614",
+        "float",
+        default="0",
+        minimum=-20,
+        maximum=20,
+        unit="°C",
+        allow_empty=True,
+    ),
+    Param("INTERVAL", "Capteurs", "Période de publication", "int", default="60", minimum=10, maximum=3600, unit="s"),
+    Param("HEATER_ENABLED", "Chauffage", "Chauffage activé", "flag", default="0", help="1 pour activer"),
+    Param(
+        "HEATER_SUPPLY_VOLTS",
+        "Chauffage",
+        "Tension d'alimentation",
+        "float",
+        minimum=0.1,
+        maximum=30,
+        unit="V",
+        help="obligatoire si le chauffage est activé",
+    ),
+    Param("HEATER_GPIO", "Chauffage", "GPIO de commande", "int", default="23", minimum=0, maximum=27),
+    Param("GPIO_RESERVED", "Chauffage", "GPIO déjà utilisés", "ints", default="", allow_empty=True),
+    Param("HEATER_PWM_HZ", "Chauffage", "Fréquence PWM", "int", default="100", minimum=1, maximum=1000, unit="Hz"),
+    Param("HEATER_RESISTORS", "Chauffage", "Nombre de résistances", "int", default="6", minimum=1, maximum=20),
+    Param(
+        "HEATER_RESISTOR_OHMS",
+        "Chauffage",
+        "Valeur d'une résistance",
+        "float",
+        default="47",
+        minimum=0.1,
+        maximum=1000,
+        unit="Ω",
+    ),
+    Param(
+        "HEATER_RESISTOR_RATING_WATTS",
+        "Chauffage",
+        "Puissance nominale d'une résistance",
+        "float",
+        default="1",
+        minimum=0.01,
+        maximum=100,
+        unit="W",
+    ),
+    Param(
+        "HEATER_MARGIN",
+        "Chauffage",
+        "Marge au-dessus du point de rosée",
+        "float",
+        default="4",
+        minimum=0,
+        maximum=10,
+        unit="°C",
+    ),
+    Param(
+        "HEATER_MAX_DOME_TEMP",
+        "Chauffage",
+        "Coupure en surchauffe",
+        "float",
+        default="35",
+        minimum=20,
+        maximum=45,
+        unit="°C",
+    ),
+    Param("HEATER_KP", "Chauffage", "Gain proportionnel", "float", default="0.3", minimum=0, maximum=100),
+    Param("HEATER_KI", "Chauffage", "Gain intégral", "float", default="0.0002", minimum=0, maximum=10),
+    Param(
+        "WEB_BIND",
+        "Interface web",
+        "Adresse d'écoute",
+        "text",
+        default="0.0.0.0",
+        restart=True,
+        help="0.0.0.0 : tout le réseau local",
+    ),
+    Param("WEB_PORT", "Interface web", "Port d'écoute", "int", default="8080", minimum=1, maximum=65535, restart=True),
+    Param("WEB_USER", "Interface web", "Utilisateur", "text", default="admin", min_length=1, restart=True),
+    Param(
+        "WEB_PASSWORD",
+        "Interface web",
+        "Mot de passe",
+        "secret",
+        min_length=12,
+        allow_empty=True,
+        restart=True,
+        help="obligatoire pour lancer l'interface : 12 caractères au moins",
+    ),
+    Param(
+        "STATE_DIR",
+        "Avancé",
+        "Dossier d'état",
+        "text",
+        allow_empty=True,
+        restart=True,
+        help="consigne de forçage et état publié (défaut : state/ à côté du programme)",
+    ),
+)
+
+ENV_KEYS = frozenset(param.name for param in ENV_SCHEMA)
+
+
+def configured_env_file(env: Mapping[str, str] | None = None) -> Path | None:
+    """Fichier d'environnement à relire, ou None s'il n'y en a pas.
+
+    ``ENV_FILE`` vide désactive la surveillance (essais, tests) ; ``ENV_FILE`` absent retombe sur
+    ``/etc/allsky-sensors/allsky-sensors.env`` s'il existe — ainsi le service reste correct même si l'unité systemd
+    oublie de le déclarer.
+    """
+    source = os.environ if env is None else env
+    if "ENV_FILE" in source:
+        text = source["ENV_FILE"].strip()
+        return Path(text) if text else None
+    return DEFAULT_ENV_FILE if DEFAULT_ENV_FILE.is_file() else None
+
+
+def service_env(env: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Configuration effective du service : environnement du processus, puis le fichier par-dessus.
+
+    Le fichier gagne : c'est lui que l'on modifie (éditeur ou interface web), l'environnement n'en est
+    qu'un instantané pris par systemd au démarrage. Sert au démarrage comme à chaque rechargement.
+    """
+    source = dict(os.environ if env is None else env)
+    path = configured_env_file(source)
+    if path is None:
+        return source
+    if not path.is_file():
+        # Unité systemd mal écrite ou fichier déplacé : sans ce message, le service tournerait muet avec
+        # l'environnement seul (voir les incidents du 22/11).
+        log.warning("%s introuvable : configuration de l'environnement uniquement", path)
+        return source
+    try:
+        source.update(read_env_file(path))
+    except OSError as error:
+        log.warning("%s illisible (%s) : configuration de l'environnement uniquement", path, error)
+    return source
+
+
+class ConfigError(ValueError):
+    """Configuration refusée : un message lisible par problème (les tests et le web les affichent)."""
+
+    def __init__(self, messages: list[str]) -> None:
+        super().__init__(" ; ".join(messages))
+        self.messages = tuple(messages)
+
+
+def validate_env(env: Mapping[str, str] | None = None) -> list[str]:
+    """Erreurs de configuration, dans l'ordre du schéma (liste vide : tout va bien).
+
+    Chaque variable présente est vérifiée selon son type et ses bornes, puis la configuration du
+    chauffage est validée en bloc (GPIO réservés, tension obligatoire si le chauffage est activé…).
+    """
+    source = os.environ if env is None else env
+    errors: list[str] = []
+    for param in ENV_SCHEMA:
+        if param.name in source:
+            message = param.validate_value(source[param.name])
+            if message:
+                errors.append(message)
+    try:
+        HeaterConfig.from_env(source)
+    except ValueError as error:
+        errors.append(f"chauffage : {error}")
+    return errors
+
+
+@dataclass(frozen=True)
+class MqttConfig:
+    host: str = "localhost"
+    port: int = 1883
+    user: str = ""
+    password: str = ""
+
+
+@dataclass(frozen=True)
+class Settings:
+    """Configuration validée, prête à l'emploi : c'est elle que la boucle recharge à chaud."""
+
+    enabled: tuple[str, ...]
+    interval: int
+    altitude: float | None
+    ds18b20_id: str | None
+    ds18b20_offset: float
+    bme280_address: int
+    mlx90614_address: int
+    mlx90614_offset: float
+    heater: HeaterConfig | None
+    mqtt: MqttConfig
+    state_dir: Path
+
+    @classmethod
+    def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
+        """Construit la configuration ; lève ConfigError si le fichier contient des erreurs."""
+        source = os.environ if env is None else env
+        errors = validate_env(source)
+        if errors:
+            raise ConfigError(errors)
+        enabled = tuple(_split_list(source.get("ENABLED", DEFAULT_SENSORS)))
+        altitude_text = source.get("ALTITUDE_M", "").strip()
+        return cls(
+            enabled=enabled,
+            interval=int(_as_float(source.get("INTERVAL"), 60)),
+            altitude=_as_float(altitude_text) if altitude_text else None,
+            ds18b20_id=source.get("DS18B20_ID", "").strip() or None,
+            ds18b20_offset=_as_float(source.get("DS18B20_OFFSET_C")),
+            bme280_address=int(source.get("BME280_ADDRESS", "0x76"), 16),
+            mlx90614_address=int(source.get("MLX90614_ADDRESS", "0x5a"), 16),
+            mlx90614_offset=_as_float(source.get("MLX90614_OFFSET_C")),
+            heater=HeaterConfig.from_env(source),
+            mqtt=MqttConfig(
+                host=source.get("MQTT_HOST", "localhost").strip() or "localhost",
+                port=int(_as_float(source.get("MQTT_PORT"), 1883)),
+                user=source.get("MQTT_USER", "").strip(),
+                password=source.get("MQTT_PASSWORD", ""),
+            ),
+            state_dir=Path(source.get("STATE_DIR", "").strip() or str(STATE_DIR_DEFAULT)),
+        )
+
+
+# --------------------------------------------------------------------------- forçage du chauffage
+
+
+def state_dir(env: Mapping[str, str] | None = None) -> Path:
+    """Dossier d'état (variable STATE_DIR) : ``state`` à côté du programme par défaut."""
+    return Path((os.environ if env is None else env).get("STATE_DIR", str(STATE_DIR_DEFAULT)))
+
+
+def override_path(env: Mapping[str, str] | None = None) -> Path:
+    """Fichier où une consigne de forçage est déposée."""
+    return state_dir(env) / OVERRIDE_FILENAME
+
+
+def write_json_atomic(path: Path, data: Mapping[str, object], mode: int = 0o600) -> None:
+    """Écrit un objet JSON en une seule opération : fichier temporaire, puis renommage.
+
+    Le service ne lit ainsi jamais un fichier à moitié écrit, même si l'interface web est interrompue.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.chmod(temporary, mode)
+    os.replace(temporary, path)
+
+
+def clear_override(path: Path) -> bool:
+    """Supprime le fichier de forçage ; True s'il existait."""
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        log.warning("consigne de forçage impossible à supprimer (%s) : %s", path, error)
+        return False
+    return True
+
+
+@dataclass(frozen=True)
+class HeaterOverride:
+    """Consigne de forçage : température à atteindre, sans tenir compte du point de rosée."""
+
+    target_c: float
+    expires_at: float  # epoch (time.time()) : au-delà, retour en régulation automatique
+    created_at: float = 0.0
+
+    def remaining(self, now: float) -> float:
+        """Secondes restantes avant expiration (0 si la consigne est expirée)."""
+        return max(self.expires_at - now, 0.0)
+
+
+def _number(value: object) -> float | None:
+    """Nombre fini tiré d'un JSON, ou None (les booléens ne sont pas des nombres ici)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return None
+    return float(value)
+
+
+def load_override(path: Path, now: float, max_target_c: float, purge_expired: bool = True) -> tuple[HeaterOverride | None, str | None]:
+    """Consigne de forçage lue sur disque : ``(consigne, None)`` ou ``(None, motif d'ignorance)``.
+
+    Les valeurs lues sont bornées : consigne ramenée entre FORCE_MIN_C et max_target_c, expiration
+    plafonnée à OVERRIDE_MAX_MINUTES. Une consigne expirée est effacée (``purge_expired``) ; un fichier
+    inexploitable est conservé, il explique ce qui s'est passé. Un fichier absent (``(None, None)``)
+    signifie simplement « régulation automatique ».
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None, None
+    except OSError as error:
+        return None, f"fichier de forçage illisible ({error})"
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return None, "fichier de forçage illisible (JSON invalide)"
+    if not isinstance(data, dict):
+        return None, "fichier de forçage invalide (objet JSON attendu)"
+    version = data.get("version", OVERRIDE_VERSION)
+    if version != OVERRIDE_VERSION:
+        return None, f"fichier de forçage en version {version!r}, version {OVERRIDE_VERSION} attendue"
+    mode = data.get("mode", "force")
+    if mode != "force":
+        return None, f"mode de forçage inconnu : {mode!r}"
+    target = _number(data.get("target_c"))
+    if target is None:
+        return None, "consigne de forçage illisible (target_c)"
+    expires = _number(data.get("expires_at"))
+    if expires is None:
+        return None, "date d'expiration du forçage illisible (expires_at)"
+    if expires <= now:
+        if purge_expired:
+            clear_override(path)
+        return None, "forçage expiré"
+    return (
+        HeaterOverride(
+            target_c=min(max(target, FORCE_MIN_C), max_target_c),  # jamais au-delà de la coupure en surchauffe
+            expires_at=min(expires, now + OVERRIDE_MAX_MINUTES * 60),  # une consigne ne dure jamais plus d'un jour
+            created_at=_number(data.get("created_at")) or 0.0,
+        ),
+        None,
+    )
+
+
+def write_override(path: Path, target_c: float, minutes: float, now: float, max_target_c: float) -> HeaterOverride:
+    """Enregistre une consigne de forçage (interface web). Lève ValueError si elle est incohérente."""
+    target = _number(target_c)
+    if target is None:
+        raise ValueError("consigne de forçage : température invalide")
+    if not FORCE_MIN_C <= target <= max_target_c:
+        raise ValueError(f"consigne de forçage : température attendue entre {FORCE_MIN_C:g} et {max_target_c:g} °C")
+    duration = _number(minutes)
+    if duration is None:
+        raise ValueError("durée de forçage invalide")
+    if not OVERRIDE_MIN_MINUTES <= duration <= OVERRIDE_MAX_MINUTES:
+        raise ValueError(f"durée de forçage attendue entre {OVERRIDE_MIN_MINUTES} et {OVERRIDE_MAX_MINUTES} minutes")
+    override = HeaterOverride(target_c=target, expires_at=now + duration * 60, created_at=now)
+    write_json_atomic(
+        path,
+        {
+            "version": OVERRIDE_VERSION,
+            "mode": "force",
+            "target_c": override.target_c,
+            "minutes": int(duration),
+            "created_at": override.created_at,
+            "expires_at": override.expires_at,
+        },
+    )
+    return override
+
+
+def apply_heater_command(text: str, config: HeaterConfig, path: Path, now: float) -> str:
+    """Applique une commande de chauffage reçue par MQTT et renvoie le compte rendu.
+
+    Formats : « 18 » (18 °C pendant OVERRIDE_DEFAULT_MINUTES), « 18 30 » (18 °C pendant 30 min),
+    « cancel » (retour à la régulation automatique). Lève ValueError si la commande est inutilisable.
+    """
+    words = text.split()
+    if not words:
+        raise ValueError("commande vide")
+    if words[0].lower() in ("cancel", "annuler", "stop", "off"):
+        if clear_override(path):
+            return "consigne annulée : retour à la régulation automatique"
+        return "aucune consigne à annuler : déjà en régulation automatique"
+    if len(words) > 2:
+        raise ValueError("format attendu : « 18 », « 18 30 » ou « cancel »")
+    try:
+        target = float(words[0].replace(",", "."))  # une virgule décimale française est tolérée
+    except ValueError:
+        raise ValueError(f"température illisible : {words[0]!r}") from None
+    try:
+        minutes = float(words[1]) if len(words) == 2 else OVERRIDE_DEFAULT_MINUTES
+    except ValueError:
+        raise ValueError(f"durée illisible : {words[1]!r}") from None
+    override = write_override(path, target, minutes, now, config.max_dome_temp)
+    until = time.strftime("%H:%M", time.localtime(override.expires_at))
+    return f"{override.target_c:g} °C pendant {minutes:g} min (jusqu'à {until})"
+
+
+# --------------------------------------------------------------------------- état publié
+
+
+def status_path(env: Mapping[str, str] | None = None) -> Path:
+    """Fichier d'état publié par le service pour l'interface web."""
+    return state_dir(env) / STATUS_FILENAME
+
+
+def write_status(path: Path, status: Mapping[str, object]) -> None:
+    """Publie l'état courant du service (écriture atomique, lisible par l'interface web).
+
+    Aucun secret n'y figure : l'interface peut donc le lire sans privilège particulier.
+    """
+    write_json_atomic(path, {**status, "version": STATUS_VERSION}, mode=0o644)
+
+
+def read_status(path: Path) -> dict[str, object] | None:
+    """État publié par le service, ou None s'il est absent, illisible ou d'une autre version."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("version") != STATUS_VERSION:
+        return None
+    return data
+
+
 class HeaterController:
-    """Régulateur PI : amène la température du dôme à (point de rosée + marge).
+    """Régulateur PI : amène la température du dôme à (point de rosée + marge), ou à une consigne forcée.
 
     La sortie est un rapport cyclique entre 0 et ``config.max_duty``. Toute mesure indispensable
-    manquante depuis plus de STALE_SECONDS, ou un dôme trop chaud, coupe le chauffage.
+    manquante depuis plus de STALE_SECONDS, ou un dôme trop chaud, coupe le chauffage ; une consigne
+    forcée ne dispense que de la mesure du point de rosée, jamais de celle du dôme.
     """
 
     def __init__(self, config: HeaterConfig) -> None:
@@ -198,12 +844,25 @@ class HeaterController:
         self._dew: float | None = None
         self._dome_at: float | None = None
         self._dew_at: float | None = None
+        self._mode: str | None = None
+        self._setpoint: float | None = None
 
     @staticmethod
     def _stale(at: float | None, now: float) -> bool:
         return at is None or now - at > STALE_SECONDS
 
-    def update(self, dome: float | None, dew: float | None, now: float) -> float:
+    @property
+    def setpoint(self) -> float | None:
+        """Cible (°C) du dernier calcul effectif : point de rosée + marge, ou consigne forcée."""
+        return self._setpoint
+
+    def update(self, dome: float | None, dew: float | None, now: float, target: float | None = None) -> float:
+        """Rapport cyclique à appliquer (entre 0 et ``config.max_duty``).
+
+        ``target`` est la consigne d'un forçage : elle remplace (point de rosée + marge) et dispense
+        d'une mesure de point de rosée. Les sécurités restent identiques : sans mesure récente du dôme,
+        ou dôme déjà à ``config.max_dome_temp``, le chauffage est coupé, forçage ou non.
+        """
         if dome is not None:
             self._dome, self._dome_at = dome, now
         if dew is not None:
@@ -211,15 +870,26 @@ class HeaterController:
         dt = 0.0 if self._last_time is None else min(max(now - self._last_time, 0.0), 60.0)
         self._last_time = now
 
-        if self._stale(self._dome_at, now) or self._stale(self._dew_at, now):
+        mode = "force" if target is not None else "auto"
+        if mode != self._mode:  # l'intégrale accumulée dans l'autre mode n'a plus de sens
+            self._mode, self._integral = mode, 0.0
+
+        if self._stale(self._dome_at, now) or (target is None and self._stale(self._dew_at, now)):
             self._integral = 0.0
+            self._setpoint = None
             return 0.0  # pas de mesure fiable : pas de chauffage
-        assert self._dome is not None and self._dew is not None
+        assert self._dome is not None
         if self._dome >= self.config.max_dome_temp:
             self._integral = 0.0
+            self._setpoint = None
             return 0.0
 
-        error = self._dew + self.config.margin - self._dome
+        if target is None:
+            assert self._dew is not None
+            self._setpoint = self._dew + self.config.margin
+        else:
+            self._setpoint = min(target, self.config.max_dome_temp)  # jamais au-delà de la coupure en surchauffe
+        error = self._setpoint - self._dome
         raw = self.config.kp * error + self._integral
         # Anti-emballement : on n'intègre pas quand la sortie est saturée dans le sens de l'écart.
         if (raw < 1.0 or error < 0) and (raw > 0.0 or error > 0):
@@ -381,9 +1051,10 @@ class WarnOnce:
             self._last[key] = now
 
 
-def enabled_sensors() -> list[str]:
+def enabled_sensors(env: Mapping[str, str] | None = None) -> list[str]:
     """Capteurs à lire (variable ENABLED, « bme280,ds18b20 » par défaut)."""
-    return [name.strip() for name in os.getenv("ENABLED", DEFAULT_SENSORS).split(",") if name.strip()]
+    source = os.environ if env is None else env
+    return [name.strip() for name in source.get("ENABLED", DEFAULT_SENSORS).split(",") if name.strip()]
 
 
 def temp_offset(variable: str, limit: float) -> float:
@@ -424,9 +1095,10 @@ def build_sensor(name: str, altitude: float | None = None):
 
 
 class Publisher:
-    def __init__(self, host: str, port: int, user: str, password: str, dry_run: bool) -> None:
+    def __init__(self, host: str, port: int, user: str, password: str, dry_run: bool, on_command=None) -> None:
         self._client = None
         self._pending: list = []
+        self._on_command = on_command  # appelé avec le texte d'une commande reçue sur le topic de commande
         if dry_run:
             return
         import paho.mqtt.client as mqtt
@@ -438,28 +1110,55 @@ class Publisher:
         if user:
             self._client.username_pw_set(user, password)
         self._client.on_connect = self._on_connect
+        self._client.on_message = self._on_message
+        self._client.on_subscribe = self._on_subscribe
         self._client.on_disconnect = self._on_disconnect
         self._client.max_queued_messages_set(200)
         self._client.reconnect_delay_set(min_delay=1, max_delay=60)
         # connect_async : le programme démarre même si le broker n'est pas encore joignable.
+        log.info("broker MQTT visé : %s:%s%s", host, port, f" (utilisateur {user})" if user else " (anonyme)")
         self._client.connect_async(host, port, keepalive=60)
         self._client.loop_start()
 
-    @staticmethod
-    def _on_connect(client, userdata, flags, reason_code, *rest) -> None:
+    def _on_connect(self, client, userdata, flags, reason_code, *rest) -> None:
         # Compatible paho-mqtt 1.x (code entier) et 2.x (objet ReasonCode).
         failed = reason_code.is_failure if hasattr(reason_code, "is_failure") else reason_code != 0
         if failed:
             log.warning("connexion MQTT refusée : %s (identifiants ? adresse ? droits du broker ?)", reason_code)
+            return
+        log.info("connecté au broker MQTT")
+        if self._on_command is not None:  # abonnement refait à chaque connexion, y compris après coupure
+            client.subscribe(f"{PREFIX}/{HEATER_COMMAND_TOPIC}", qos=1)
+            log.info("commandes acceptées sur %s/%s : « 18 », « 18 30 » ou « cancel »", PREFIX, HEATER_COMMAND_TOPIC)
+
+    @staticmethod
+    def _on_subscribe(client, userdata, mid, reason_codes, *rest) -> None:
+        """Accusé d'abonnement : un refus de droits du broker devient ainsi visible dans le journal."""
+        codes = reason_codes if isinstance(reason_codes, (list, tuple)) else [reason_codes]
+        refused = [code for code in codes if getattr(code, "is_failure", False) or getattr(code, "value", code) == 128]
+        if refused:
+            log.error("abonnement au topic de commande refusé (%s) : droits MQTT de l'utilisateur à vérifier", refused[0])
         else:
-            log.info("connecté au broker MQTT")
+            log.info("abonnement au topic de commande accepté")
+
+    def _on_message(self, client, userdata, message) -> None:
+        """Message reçu sur le topic de commande : texte brut (« 18 », « 18 30 », « cancel »)."""
+        if self._on_command is None:
+            return
+        text = message.payload.decode("utf-8", "replace")
+        try:
+            self._on_command(text)
+        except Exception as error:  # noqa: BLE001 - une commande en échec ne doit jamais tuer le client MQTT
+            log.warning("commande de chauffage %r non traitée : %s", text, error)
 
     @staticmethod
     def _on_disconnect(client, userdata, *args) -> None:
         log.warning("connexion MQTT perdue, nouvelle tentative automatique")
 
-    def publish(self, name: str, value: float) -> None:
-        topic, payload = f"{PREFIX}/{name}", f"{value:.2f}"
+    def publish(self, name: str, value: float | str) -> None:
+        """Publie une mesure (deux décimales) ou un texte, tel que le mode du chauffage."""
+        topic = f"{PREFIX}/{name}"
+        payload = value if isinstance(value, str) else f"{value:.2f}"
         if self._client is None:
             print(f"{topic} {payload}")
         else:
@@ -482,17 +1181,18 @@ class Publisher:
 # --------------------------------------------------------------------------- programme
 
 
-def topic_names() -> tuple[str, ...]:
+def topic_names(env: Mapping[str, str] | None = None) -> tuple[str, ...]:
     """Topics à coller dans le champ « Pin » d'indi-allsky : ceux des capteurs activés, et ceux qui dépendent des réglages."""
-    enabled = enabled_sensors()
+    source = os.environ if env is None else env
+    enabled = enabled_sensors(source)
     names: list[str] = []
     for sensor, topics in SENSOR_TOPICS.items():
         if sensor not in enabled:
             continue  # capteur non activé : son topic ne serait jamais publié
         names += topics
-        if sensor == "bme280" and os.getenv("ALTITUDE_M", "").strip():  # avec l'altitude, la pression de station est publiée en plus
+        if sensor == "bme280" and source.get("ALTITUDE_M", "").strip():  # avec l'altitude, la pression de station est publiée en plus
             names.insert(names.index("outdoor_pressure") + 1, "outdoor_pressure_station")
-    if os.getenv("HEATER_ENABLED", "0") == "1":
+    if source.get("HEATER_ENABLED", "0").strip() == "1":
         names.append(HEATER_TOPIC)
     return tuple(names)
 
@@ -512,6 +1212,107 @@ def heater_test(config: HeaterConfig, percent: float, seconds: float) -> int:
     return 0
 
 
+def heater_test_command(percent: float, seconds: float) -> int:
+    """Essai de câblage lancé à la main : lit le fichier d'environnement, comme --heater-force.
+
+    Sans cela, la commande lancée par SSH ne voyait ni HEATER_ENABLED ni HEATER_SUPPLY_VOLTS, que
+    systemd ne fournit qu'au service.
+    """
+    try:
+        config = HeaterConfig.from_env(cli_env())
+    except ValueError as error:
+        log.error("configuration du chauffage invalide : %s", error)
+        return 2
+    if config is None:
+        log.error("HEATER_ENABLED=1 et HEATER_SUPPLY_VOLTS sont nécessaires pour l'essai du chauffage")
+        return 2
+    return heater_test(config, percent, seconds)
+
+
+def heater_command(target: float | None, minutes: float, cancel: bool) -> int:
+    """Enregistre (ou annule) une consigne de forçage pour le service en marche.
+
+    La sortie PWM reste pilotée par le service : la consigne est un fichier qu'il relit à chaque tick
+    (10 s au plus). Sans service en marche, rien ne chauffe ; et au démarrage suivant, la consigne
+    est annulée (retour en régulation automatique).
+    """
+    env = cli_env()
+    path = override_path(env)
+    if cancel:
+        if clear_override(path):
+            log.info("consigne de forçage supprimée : retour à la régulation automatique (point de rosée + marge)")
+        else:
+            log.info("aucune consigne de forçage à supprimer : le chauffage est déjà en régulation automatique")
+        return 0
+    try:
+        config = HeaterConfig.from_env(env)
+    except ValueError as error:
+        log.error("configuration du chauffage invalide : %s", error)
+        return 2
+    if config is None:
+        log.error("HEATER_ENABLED=1 et HEATER_SUPPLY_VOLTS sont nécessaires pour forcer le chauffage")
+        return 2
+    assert target is not None  # argparse garantit une température hors --heater-cancel
+    try:
+        override = write_override(path, target, minutes, time.time(), config.max_dome_temp)
+    except (ValueError, OSError) as error:
+        log.error("consigne de forçage refusée : %s", error)
+        return 2
+    log.info(
+        "consigne de forçage enregistrée : %g °C pendant %g min (jusqu'à %s), appliquée par le service au tick suivant",
+        override.target_c,
+        minutes,
+        time.strftime("%H:%M", time.localtime(override.expires_at)),
+    )
+    log.info("suivre l'effet : journalctl -u allsky-sensors -f (ligne « … cible %g °C … (forcé) »)", override.target_c)
+    return 0
+
+
+def _file_mtime(path: Path) -> float | None:
+    """Date de dernière modification d'un fichier (None s'il est absent ou illisible)."""
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return None
+
+
+@dataclass
+class Runtime:
+    """Tout ce qui dépend de la configuration et doit être reconstruit lors d'un rechargement."""
+
+    settings: Settings
+    names: list[str]
+    sensors: dict[str, object | None]
+    controller: HeaterController | None
+    output: object | None
+    error: str | None = None  # raison pour laquelle le chauffage n'a pas de sortie (GPIO occupé…)
+
+
+def build_runtime(settings: Settings, simulate: bool = False, dry_run: bool = False) -> Runtime:
+    """Construit capteurs et chauffage pour une configuration donnée (rechargeable à chaud)."""
+    names = ["simulation"] if simulate else list(settings.enabled)
+    sensors: dict[str, object | None] = {name: Simulated(settings.altitude) if simulate else None for name in names}
+    controller = output = None
+    error = None
+    if settings.heater is not None:
+        log.info(settings.heater.describe())
+        controller = HeaterController(settings.heater)
+        try:
+            output = NullOutput() if (dry_run or simulate) else PwmOutput(settings.heater.gpio, settings.heater.pwm_hz)
+        except Exception as failure:  # noqa: BLE001 - le service continue, chauffage coupé
+            controller = None
+            error = f"sortie PWM impossible (gpiozero installé ? GPIO {settings.heater.gpio} libre ?) : {failure}"
+    return Runtime(settings, names, sensors, controller, output, error)
+
+
+def close_runtime(runtime: Runtime) -> None:
+    """Coupe le chauffage et libère le GPIO (appelé avant toute reconstruction et à l'arrêt)."""
+    if runtime.output is not None:
+        runtime.output.close()
+        runtime.output = None
+    runtime.controller = None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument("--once", action="store_true", help="une seule série de mesures, puis quitter")
@@ -522,73 +1323,84 @@ def main() -> int:
         "--heater-test", type=float, metavar="POURCENT", help="chauffer à ce rapport cyclique (plafonné) pendant quelques secondes"
     )
     parser.add_argument("--heater-test-seconds", type=float, default=10, help="durée de l'essai (défaut : 10 s)")
+    parser.add_argument(
+        "--heater-force",
+        type=float,
+        metavar="TEMP_C",
+        help="enregistre une consigne de forçage : chauffer jusqu'à cette température (°C), sans point de rosée",
+    )
+    parser.add_argument(
+        "--heater-force-minutes",
+        type=float,
+        default=OVERRIDE_DEFAULT_MINUTES,
+        help=f"durée de la consigne forcée ({OVERRIDE_MIN_MINUTES} à {OVERRIDE_MAX_MINUTES} min, défaut : {OVERRIDE_DEFAULT_MINUTES})",
+    )
+    parser.add_argument("--heater-cancel", action="store_true", help="annule la consigne forcée (retour au point de rosée + marge)")
     args = parser.parse_args()
 
     if args.print_topics:
-        print(",".join(f"{PREFIX}/{name}" for name in topic_names()))
+        environment = cli_env()  # lancé à la main : la vérité est dans le fichier d'environnement
+        prefix = environment.get("MQTT_PREFIX", PREFIX)
+        print(",".join(f"{prefix}/{name}" for name in topic_names(environment)))
         return 0
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-    try:
-        heater_config = HeaterConfig.from_env()
-    except ValueError as error:
-        log.error("configuration du chauffage invalide : %s", error)
-        return 2
 
     if args.heater_test is not None:
-        if heater_config is None:
-            log.error("HEATER_ENABLED=1 et HEATER_SUPPLY_VOLTS sont nécessaires pour l'essai du chauffage")
-            return 2
-        return heater_test(heater_config, args.heater_test, args.heater_test_seconds)
+        return heater_test_command(args.heater_test, args.heater_test_seconds)
 
-    try:
-        offset = ds18b20_offset()
-    except ValueError as error:
-        log.error("DS18B20_OFFSET_C invalide : %s", error)
-        return 2
-    if offset:
-        log.info("DS18B20 : correction de %+g °C appliquée à la température du dôme", offset)
+    if args.heater_force is not None or args.heater_cancel:
+        return heater_command(args.heater_force, args.heater_force_minutes, args.heater_cancel)
 
+    env_file = configured_env_file()
     try:
-        sky_offset = mlx90614_offset()
-    except ValueError as error:
-        log.error("MLX90614_OFFSET_C invalide : %s", error)
+        settings = Settings.from_env(service_env())
+    except ConfigError as error:
+        for message in error.messages:
+            log.error("%s", message)
         return 2
-    if sky_offset:
-        log.info("MLX90614 : correction de %+g °C appliquée à la température du ciel", sky_offset)
-
-    interval = int(os.getenv("INTERVAL", "60"))
-    names = ["simulation"] if args.simulate else enabled_sensors()
-    altitude_text = os.getenv("ALTITUDE_M", "").strip()
-    try:
-        altitude = float(altitude_text) if altitude_text else None
-        if altitude is not None and not -500 <= altitude <= 9000:
-            raise ValueError
-    except ValueError:
-        log.error("ALTITUDE_M invalide : %r (altitude du capteur en mètres, entre -500 et 9000)", altitude_text)
-        return 2
-    if altitude is None:
+    if settings.ds18b20_offset:
+        log.info("DS18B20 : correction de %+g °C appliquée à la température du dôme", settings.ds18b20_offset)
+    if settings.mlx90614_offset:
+        log.info("MLX90614 : correction de %+g °C appliquée à la température du ciel", settings.mlx90614_offset)
+    if settings.altitude is None:
         log.info("ALTITUDE_M non défini : la pression publiée est la pression de station, non ramenée au niveau de la mer")
-    sensors: dict[str, object | None] = {name: Simulated(altitude) if args.simulate else None for name in names}
 
-    controller = output = None
-    if heater_config is not None:
-        log.info(heater_config.describe())
-        controller = HeaterController(heater_config)
+    runtime = build_runtime(settings, simulate=args.simulate, dry_run=args.dry_run)
+    if runtime.error is not None:
+        log.error("%s", runtime.error)
+        return 2
+    forced_file = settings.state_dir / OVERRIDE_FILENAME
+    if clear_override(forced_file):
+        log.info("consigne de forçage trouvée au démarrage : annulée, retour en régulation automatique")
+    if runtime.controller is None:
+        log.info("chauffage désactivé : aucune commande de forçage ne sera acceptée (HEATER_ENABLED=1 pour l'activer)")
+
+    def heater_on_command(text: str) -> None:
+        """Commande reçue par MQTT : une consigne que la boucle applique au tick suivant."""
+        heater = runtime.settings.heater  # lu à chaque appel : le chauffage a pu être activé à chaud
+        if heater is None:
+            log.warning("commande de chauffage ignorée (%r) : chauffage désactivé", text)
+            return
         try:
-            output = NullOutput() if (args.dry_run or args.simulate) else PwmOutput(heater_config.gpio, heater_config.pwm_hz)
-        except Exception as error:  # noqa: BLE001
-            log.error("sortie PWM impossible (gpiozero installé ? GPIO %s libre ?) : %s", heater_config.gpio, error)
-            return 2
-    tick = HEATER_TICK_SECONDS if controller else min(interval, MAX_TICK_SECONDS)
+            path = runtime.settings.state_dir / OVERRIDE_FILENAME
+            report = apply_heater_command(text, heater, path, time.time())
+        except (ValueError, OSError) as error:
+            log.warning("commande de chauffage refusée (%r) : %s", text, error)
+            return
+        log.info("commande de chauffage reçue (%r) : %s", text, report)
 
-    publisher = Publisher(
-        os.getenv("MQTT_HOST", "localhost"),
-        int(os.getenv("MQTT_PORT", "1883")),
-        os.getenv("MQTT_USER", ""),
-        os.getenv("MQTT_PASSWORD", ""),
-        args.dry_run,
-    )
+    def make_publisher(current: Runtime) -> Publisher:
+        return Publisher(
+            current.settings.mqtt.host,
+            current.settings.mqtt.port,
+            current.settings.mqtt.user,
+            current.settings.mqtt.password,
+            args.dry_run,
+            on_command=heater_on_command if current.controller else None,
+        )
+
+    publisher = make_publisher(runtime)
     stop = threading.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda *_: stop.set())
@@ -597,16 +1409,42 @@ def main() -> int:
     readings: dict[str, tuple[float, float]] = {}  # topic -> (valeur, instant de la mesure)
     last_publish: float | None = None
     duty = 0.0
+    override: HeaterOverride | None = None
     warn = WarnOnce()
     unavailable: set[str] = set()
+    settings_mtime = _file_mtime(env_file) if env_file is not None else None
+    config_error: str | None = None
     try:
         while not stop.is_set():
             now = time.monotonic()
+
+            if env_file is not None and _file_mtime(env_file) != settings_mtime:
+                settings_mtime = _file_mtime(env_file)  # mémorisé même si le fichier est refusé
+                try:
+                    reloaded = Settings.from_env(service_env())
+                except (ConfigError, OSError) as error:
+                    messages = list(error.messages) if isinstance(error, ConfigError) else [str(error)]
+                    for message in messages:
+                        log.error("configuration non appliquée : %s", message)
+                    config_error = " ; ".join(messages)  # visible dans status.json et donc sur le web
+                else:
+                    config_error = None
+                    restart_mqtt = reloaded.mqtt != runtime.settings.mqtt
+                    close_runtime(runtime)  # coupe le chauffage et libère le GPIO avant de le redemander
+                    runtime = build_runtime(reloaded, simulate=args.simulate, dry_run=args.dry_run)
+                    unavailable.clear()
+                    if runtime.error is not None:
+                        log.error("chauffage indisponible : %s", runtime.error)
+                    if restart_mqtt:
+                        publisher.close()
+                        publisher = make_publisher(runtime)
+                    log.info("configuration rechargée depuis %s", env_file)
+
             current: dict[str, float] = {}
-            for name in names:
-                if sensors[name] is None:  # première fois, ou échec précédent : on réessaie à chaque cycle
+            for name in runtime.names:
+                if runtime.sensors[name] is None:  # première fois, ou échec précédent : on réessaie à chaque cycle
                     try:
-                        sensors[name] = build_sensor(name, altitude)
+                        runtime.sensors[name] = build_sensor(name, runtime.settings.altitude)
                     except Exception as error:  # noqa: BLE001 - un capteur absent ne doit pas arrêter les autres
                         warn(f"build-{name}", "capteur %s indisponible : %s", name, error)
                         unavailable.add(name)
@@ -615,41 +1453,86 @@ def main() -> int:
                     unavailable.discard(name)
                     log.info("capteur %s disponible", name)
                 try:
-                    current.update(sensors[name].read())
+                    current.update(runtime.sensors[name].read())
                 except Exception as error:  # noqa: BLE001
                     warn(f"read-{name}", "lecture de %s impossible : %s", name, error)
-                    sensors[name] = None
+                    runtime.sensors[name] = None
             for topic, value in current.items():
                 readings[topic] = (value, now)
 
-            if controller and output:
-                duty = controller.update(current.get("dome_temperature"), current.get("outdoor_dew_point"), now)
-                output.set(duty)
+            override = None
+            if runtime.controller and runtime.output:
+                heater = runtime.settings.heater
+                assert heater is not None
+                override, ignored = load_override(runtime.settings.state_dir / OVERRIDE_FILENAME, time.time(), heater.max_dome_temp)
+                if ignored:
+                    warn(f"override-{ignored}", "forçage ignoré : %s", ignored)
+                duty = runtime.controller.update(
+                    current.get("dome_temperature"),
+                    current.get("outdoor_dew_point"),
+                    now,
+                    target=override.target_c if override else None,
+                )
+                runtime.output.set(duty)
+                # état du chauffage publié à chaque tick (10 s) : une interface de pilotage doit être réactive
+                publisher.publish(HEATER_TOPIC, duty * 100)
+                publisher.publish(HEATER_MODE_TOPIC, "force" if override else "auto")
+                if runtime.controller.setpoint is not None:
+                    publisher.publish(HEATER_TARGET_TOPIC, runtime.controller.setpoint)
+            else:
+                duty = 0.0
 
-            if last_publish is None or now - last_publish >= interval:
+            if last_publish is None or now - last_publish >= runtime.settings.interval:
                 for topic, (value, measured_at) in readings.items():
                     if now - measured_at <= MAX_AGE_SECONDS:
                         publisher.publish(topic, value)
-                if controller:
-                    publisher.publish(HEATER_TOPIC, duty * 100)
+                if runtime.controller:
+                    setpoint = runtime.controller.setpoint
                     dome, dew = current.get("dome_temperature"), current.get("outdoor_dew_point")
-                    if dome is not None and dew is not None:
+                    suffix = " (forcé)" if override else ""
+                    if dome is not None and setpoint is not None and dew is not None:
                         log.info(
-                            "dôme %.1f °C, rosée %.1f °C, cible %.1f °C, chauffage %.0f %%",
+                            "dôme %.1f °C, rosée %.1f °C, cible %.1f °C, chauffage %.0f %%%s",
                             dome,
                             dew,
-                            dew + heater_config.margin,
+                            setpoint,
                             duty * 100,
+                            suffix,
                         )
+                    elif dome is not None and setpoint is not None:
+                        log.info("dôme %.1f °C, cible %.1f °C, chauffage %.0f %%%s", dome, setpoint, duty * 100, suffix)
                 last_publish = now
+
+            setpoint = runtime.controller.setpoint if runtime.controller else None
+            status_file = runtime.settings.state_dir / STATUS_FILENAME
+            try:
+                write_status(
+                    status_file,
+                    {
+                        "updated_at": time.time(),
+                        "mode": "force" if override else "auto",
+                        "target_c": setpoint,
+                        "override_target_c": override.target_c if override else None,
+                        "override_expires_at": override.expires_at if override else None,
+                        "dome_c": current.get("dome_temperature"),
+                        "dew_c": current.get("outdoor_dew_point"),
+                        "duty_pct": duty * 100,
+                        "readings": {topic: value for topic, (value, _at) in readings.items()},
+                        "sensors_unavailable": sorted(unavailable),
+                        "config_error": config_error,
+                        "settings_mtime": settings_mtime,
+                        "pid": os.getpid(),
+                    },
+                )
+            except OSError as error:
+                warn(f"status-{error}", "état non publié (%s) : %s", status_file, error)
 
             systemd_notify(b"WATCHDOG=1")
             if args.once:
                 break
-            stop.wait(tick)
+            stop.wait(HEATER_TICK_SECONDS if runtime.controller else min(runtime.settings.interval, MAX_TICK_SECONDS))
     finally:
-        if output:
-            output.close()  # le chauffage est toujours coupé en quittant
+        close_runtime(runtime)  # le chauffage est toujours coupé en quittant
         publisher.close()
     return 0
 

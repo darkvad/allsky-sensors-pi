@@ -4,9 +4,12 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-# Remplace TON_UTILISATEUR par un compte membre des groupes i2c et gpio.
+# Le compte est substitué à l'installation (voir README) ; à défaut, mets ton compte ici.
 User=TON_UTILISATEUR
-EnvironmentFile=/etc/allsky-sensors.env
+EnvironmentFile=/etc/allsky-sensors/allsky-sensors.env
+# Le service relit ce fichier dès qu'il change : les réglages modifiés (interface web, éditeur) sont
+# appliqués sans redémarrage, au tick suivant (10 s avec chauffage, 30 s au plus sinon).
+Environment=ENV_FILE=/etc/allsky-sensors/allsky-sensors.env
 ExecStart=/opt/allsky-sensors/venv/bin/python /opt/allsky-sensors/allsky_sensors_mqtt.py
 Restart=on-failure
 RestartSec=10

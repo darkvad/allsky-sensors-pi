@@ -25,6 +25,10 @@ htmlcov/
 allsky-sensors.env
 .env
 
+# État du programme (consigne de forçage, état publié pour l'interface web)
+state/
+*.env.bak
+
 # Éditeurs / OS
 .vscode/
 .idea/
